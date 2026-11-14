@@ -11,8 +11,19 @@ mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
 
 cp src/Info.plist "$APP_DIR/Contents/Info.plist"
-cp assets/preview-wallpaper.png "$APP_DIR/Contents/Resources/preview-wallpaper.png"
-cp -R assets/logos "$APP_DIR/Contents/Resources/logos"
+
+# 二进制素材是可选的：仓库里没带壁纸和位图 logo 时，跳过拷贝也能编出可用 App
+if [ -f assets/preview-wallpaper.png ]; then
+  cp assets/preview-wallpaper.png "$APP_DIR/Contents/Resources/preview-wallpaper.png"
+else
+  echo "==> 跳过 preview-wallpaper.png（未提供，设置页预览会退回渐变底）"
+fi
+
+if [ -d assets/logos ]; then
+  cp -R assets/logos "$APP_DIR/Contents/Resources/logos"
+else
+  echo "==> 跳过 logos（未提供，厂商图标会退回 SF Symbol）"
+fi
 
 echo "==> 编译 Swift 源码"
 swiftc \

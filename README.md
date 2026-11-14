@@ -128,9 +128,9 @@ src/
   SettingsWindow.swift    NSWindow + 设置分页 + 品牌 logo 加载
   HotKeyManager.swift     Carbon 全局快捷键
   Components.swift        封面、镜头点、均衡器、进度条、音量分段、环形图等
+  CloudChatService.swift  CloudProvider / 13 家预设 / OpenAI 兼容流式客户端
   Snapshot.swift          离屏预览
   Services/
-    CloudChatService.swift  CloudProvider / 13 家预设 / OpenAI 兼容流式客户端
     LlamaService.swift      本地 Ollama 客户端
     NowPlaying.swift        MediaRemote 正在播放
     AudioService.swift      CoreAudio 音量
@@ -140,8 +140,8 @@ src/
     LauncherService.swift   应用扫描与启动
     StashStore.swift        笔记与文件暂存持久化
 assets/
-  logos/                  13 家厂商品牌图标
-  preview-wallpaper.png   设置页预览底图
+  logos/                  13 家厂商品牌图标（SVG，豆包为 PNG）
+  preview-wallpaper.png   设置页预览底图（可选）
 ```
 
 ## 已知边界
@@ -151,6 +151,7 @@ assets/
 - 输入框要在展开态点一下才拿到键盘焦点（LSUIElement 无 Dock 图标，切到 AI 页签会主动激活自身）
 - 暂存只记路径，原文件被删除后会自动从列表里消失
 - CoreSVG 不识别 `em` 单位、不支持 Gemini 那套半透明渐变，所以厂商图标在入仓前已做过 SVG 兼容处理
+- 二进制素材（`assets/logos/doubao.png`、`assets/preview-wallpaper.png`、截图）未随仓库分发：缺失时 `build.sh` 自动跳过拷贝，设置页预览退回渐变底，豆包图标退回 `flame.fill` 符号
 
 ## License
 
