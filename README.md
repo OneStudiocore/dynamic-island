@@ -15,6 +15,7 @@ A native macOS Dynamic Island in AppKit + SwiftUI — no Xcode project, just `sw
 - Seven tabs: Home, Launcher, File shelf, Music, Timer, Clipboard and an AI chat panel.
 - AI chat speaks both **local Ollama** and **13 cloud providers** (OpenAI, DeepSeek, Gemini, Doubao/Ark, Qwen, Zhipu, Kimi, OpenRouter, xAI, Mistral, SiliconFlow, 01.AI, Perplexity) through one unified model picker.
 - No Dock icon; a separate settings window with 9 pages covers everything from panel geometry to per-provider API keys.
+- **License: proprietary, all rights reserved.** The source is public for reference and personal use only — no modification, no derivative works, no redistribution, no commercial use. See [`LICENSE`](LICENSE).
 
 Requires macOS 26 or later. Build with `./build.sh`.
 
@@ -153,6 +154,22 @@ assets/
 - CoreSVG 不识别 `em` 单位、不支持 Gemini 那套半透明渐变，所以厂商图标在入仓前已做过 SVG 兼容处理
 - 二进制素材（`assets/logos/doubao.png`、`assets/preview-wallpaper.png`、截图）未随仓库分发：缺失时 `build.sh` 自动跳过拷贝，设置页预览退回渐变底，豆包图标退回 `flame.fill` 符号
 
+## 版权与许可
+
+本项目的版权归 **OneStudiocore** 所有（© 2026 OneStudiocore，保留所有权利）。
+
+**这不是开源软件。** 代码公开只为透明、参考与个人研究，采用 [PolyForm Strict License 1.0.0](https://polyformproject.org/licenses/strict/1.0.0)，完整条款见仓库根目录的 [`LICENSE`](LICENSE)。用一句话概括：
+
+- **可以用**：clone 下来自己编译、装在自己机器上日常用、读源码学习，或在文章/视频里介绍并注明出处
+- **不可以**：修改、二次开发、做成衍生品、再分发（包括打包成自己的 App 发出去）、商用（含广告分成、付费下载、放进自己的产品里）、抹掉版权与署名、把源码换个名字再发一遍
+- **想商用或想要授权**：直接联系作者，谈得成就给书面授权
+
+公开仓库在平台层面允许 fork，但 fork 出来的副本仍然受同一份许可约束 —— 不能改，不能再分发。
+
+如果发现有人违反许可，可以先在 Issues 里说一声，作者有权要求下架并追究。
+
 ## License
 
-MIT
+Proprietary — PolyForm Strict License 1.0.0, © 2026 OneStudiocore. All rights reserved.
+
+You may read, build and use this software for personal or noncommercial purposes, but you may **not** modify it, create derivative works, redistribute it, or use it commercially. Full terms in [`LICENSE`](LICENSE).
