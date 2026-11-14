@@ -25,6 +25,17 @@ else
   echo "==> 跳过 logos（未提供，厂商图标会退回 SF Symbol）"
 fi
 
+# 图标是代码画的：每次构建重新渲染 iconset → icns，不往仓库塞二进制
+echo "==> 绘制 App 图标"
+mkdir -p build
+if swiftc -O Tools/make-icon.swift -o build/make-icon \
+   && ./build/make-icon build \
+   && iconutil -c icns build/AppIcon.iconset -o build/AppIcon.icns; then
+  cp build/AppIcon.icns "$APP_DIR/Contents/Resources/AppIcon.icns"
+else
+  echo "==> 图标生成失败，跳过（App 会用系统默认图标）"
+fi
+
 echo "==> 编译 Swift 源码"
 swiftc \
   -O \
