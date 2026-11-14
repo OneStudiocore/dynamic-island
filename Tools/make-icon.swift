@@ -1,4 +1,4 @@
-// 生成 AppIcon：纯代码绘制一个极简的「灵动岛」图标
+// 生成 AppIcon：纯代码绘制一个极简的「灵动岛」图标（黑底 + 白色大写 O）
 // 用法：swiftc -O Tools/make-icon.swift -o /tmp/make-icon && /tmp/make-icon <输出目录>
 // 输出：<输出目录>/AppIcon.iconset/*.png 与 <输出目录>/AppIcon.icns
 // 依赖：CoreGraphics / ImageIO / iconutil（macOS 自带）
@@ -26,67 +26,32 @@ func drawIcon(into ctx: CGContext) {
     ctx.setShouldAntialias(true)
     ctx.interpolationQuality = .high
 
-    // 底盘：圆角方形 + 石墨色竖向渐变
+    // 底盘：纯黑圆角方形
     let plate = rounded(CGRect(x: 0, y: 0, width: S, height: S), 226)
     ctx.saveGState()
     ctx.addPath(plate)
-    ctx.clip()
-    let bg = CGGradient(colorsSpace: srgb, colors: [
-        CGColor(srgbRed: 0.196, green: 0.196, blue: 0.212, alpha: 1),
-        CGColor(srgbRed: 0.102, green: 0.102, blue: 0.110, alpha: 1),
-        CGColor(srgbRed: 0.050, green: 0.050, blue: 0.055, alpha: 1)
-    ] as CFArray, locations: [0, 0.55, 1])!
-    ctx.drawLinearGradient(bg, start: CGPoint(x: 0, y: S), end: CGPoint(x: 0, y: 0), options: [])
-    ctx.restoreGState()
-
-    // 底盘内描边：一圈极淡的亮边，代替阴影做「玻璃边缘」
-    ctx.saveGState()
-    ctx.addPath(plate)
-    ctx.setStrokeColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.10))
-    ctx.setLineWidth(2.5)
-    ctx.strokePath()
-    ctx.restoreGState()
-
-    // 岛体：纯黑胶囊，略微上浮 + 柔和投影
-    let w: CGFloat = 648, h: CGFloat = 184
-    let pill = CGRect(x: (S - w) / 2, y: (S - h) / 2 + 26, width: w, height: h)
-    let pillPath = rounded(pill, h / 2)
-
-    ctx.saveGState()
-    ctx.setShadow(offset: CGSize(width: 0, height: -8), blur: 34,
-                  color: CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.55))
-    ctx.addPath(pillPath)
     ctx.setFillColor(CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 1))
     ctx.fillPath()
-    ctx.restoreGState()
-
-    // 胶囊上沿的高光：由白到透明，只铺上半部分，模拟液态玻璃的反光
-    ctx.saveGState()
-    ctx.addPath(pillPath)
-    ctx.clip()
-    let gloss = CGGradient(colorsSpace: srgb, colors: [
-        CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.26),
-        CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.04),
-        CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0)
-    ] as CFArray, locations: [0, 0.45, 1])!
-    ctx.drawLinearGradient(gloss, start: CGPoint(x: 0, y: pill.maxY), end: CGPoint(x: 0, y: pill.midY), options: [])
-    ctx.restoreGState()
-
-    // 内圈细边：暗示玻璃的厚度，不要发光
-    ctx.saveGState()
-    ctx.addPath(rounded(pill.insetBy(dx: 7, dy: 7), (h - 14) / 2))
-    ctx.setStrokeColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.07))
+    // 极淡的内描边：让纯黑底盘在深色桌面上仍有一圈边界，不加光晕
+    ctx.addPath(plate)
+    ctx.setStrokeColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.08))
     ctx.setLineWidth(2)
     ctx.strokePath()
     ctx.restoreGState()
 
-    // 胶囊轮廓：0.7pt 级的细亮边
-    ctx.saveGState()
-    ctx.addPath(pillPath)
-    ctx.setStrokeColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.22))
-    ctx.setLineWidth(3.5)
+    // 主体：白色大写 O —— 偏长方形，圆角中等，笔画中等偏细
+    let stroke: CGFloat = 46            // 笔画宽度（约 4.5% 画布，中等偏细）
+    let w: CGFloat = 496, h: CGFloat = 636   // 外轮廓：竖向长方形
+    let r: CGFloat = 112                // 外圆角：中等，保留长方形的方正感
+    // 路径取笔画中线，外围 stroke/2 后正好落在外轮廓上
+    let midRect = CGRect(x: (S - w + stroke) / 2, y: (S - h + stroke) / 2,
+                         width: w - stroke, height: h - stroke)
+    let oPath = rounded(midRect, r - stroke / 2)
+
+    ctx.addPath(oPath)
+    ctx.setStrokeColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1))
+    ctx.setLineWidth(stroke)
     ctx.strokePath()
-    ctx.restoreGState()
 }
 
 func png(_ ctx: CGContext, side: Int) -> Data? {
