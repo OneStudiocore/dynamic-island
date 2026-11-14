@@ -18,3 +18,7 @@
 
 # 本地存档
 进度存档-*.md
+build/
+dist/
+*.dmg
+*.icns
