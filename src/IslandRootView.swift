@@ -27,13 +27,13 @@ struct IslandRootView: View {
 
     private func island(geo: IslandGeometry, shape: IslandShape) -> some View {
         ZStack {
-            bodyFill(shape: shape)
+            bodyFill(geo: geo, shape: shape)
             contentLayer(geo: geo)
         }
         .frame(width: geo.size.width, height: geo.size.height)
         .background(glassBackdrop(shape: shape))
         .clipShape(shape)
-        .overlay(rim(shape: shape))
+        .overlay(rim(shape: shape, geo: geo))
         .overlay(sheen(shape: shape))
         // 收起态阴影更轻更贴，避免小胶囊挂着一团黑影；展开态保留纵深；强度可手动调节
         .shadow(color: .black.opacity(model.morphing ? 0.0 : (model.expanded ? 0.42 : 0.26) * model.shadowStrength),
@@ -53,12 +53,24 @@ struct IslandRootView: View {
         .offset(y: geo.topInset)
     }
 
-    /// 上半死黑、下半化开成液态玻璃；AI 面板更高，黑色区域也相应下移
+    // MARK: - 形变可见度
+
+    /// 岛体宽度低于 210pt 时内容全隐藏、高于 330pt 时全显示，中间线性升幂淡入。
+    /// 形变途中（胶囊 ↔ 面板）内容不会再被圆角裁成碎片。
+    private func contentOpacity(currentWidth: CGFloat) -> Double {
+        guard model.expanded else { return 0.72 }
+        let low = 210 * s
+        let high = 330 * s
+        let ramp = min(1.0, max(0.0, Double((currentWidth - low) / (high - low))))
+        return pow(ramp, 1.4)
+    }
 
     /// ② 本体：展开时上半死黑、下半渐变到真透明；收起时纯黑
     @ViewBuilder
-    private func bodyFill(shape: IslandShape) -> some View {
-        if model.expanded {
+    private func bodyFill(geo: IslandGeometry, shape: IslandShape) -> some View {
+        // 形变途中岛体还没长开时用纯黑：否则半截胶囊仍挂着展开态的底部渐变，收起时留一圈灰边
+        let narrow = geo.size.width < 330 * s
+        if model.expanded && !narrow {
             shape.fill(LinearGradient(stops: blackStops, startPoint: .top, endPoint: .bottom))
         } else {
             shape.fill(Color.black)
@@ -67,10 +79,12 @@ struct IslandRootView: View {
 
     /// ③ 内容层
     private func contentLayer(geo: IslandGeometry) -> some View {
-        content(geo: geo)
-            .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
-            .opacity(model.expanded ? 1.0 : 0.72)
-            .animation(.easeInOut(duration: 0.26), value: model.expanded)
+        GeometryReader { proxy in
+            content(geo: geo)
+                .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
+                .opacity(contentOpacity(currentWidth: proxy.size.width))
+        }
+        .animation(.easeInOut(duration: 0.26), value: model.expanded)
     }
 
     /// ① 官方 Liquid Glass，只保留在「边缘带」：中间整块挖空 → 内部永远像素级透明
@@ -122,8 +136,10 @@ struct IslandRootView: View {
     }
 
     /// 玻璃边缘的镜面反光（液态玻璃最典型的特征）
-    private func rim(shape: IslandShape) -> some View {
-        shape.stroke(
+    private func rim(shape: IslandShape, geo: IslandGeometry) -> some View {
+        // 内容已淡出时边缘反光一并压暗：黑色岛体在纯黑背景上不留一圈空描边
+        let dim = model.expanded ? (0.15 + 0.85 * contentOpacity(currentWidth: geo.size.width)) : 1.0
+        return shape.stroke(
             LinearGradient(
                 stops: [
                     .init(color: .white.opacity(0.30 * model.rimBrightness), location: 0.0),
@@ -136,6 +152,7 @@ struct IslandRootView: View {
             ),
             lineWidth: 1
         )
+        .opacity(dim)
         .blendMode(.plusLighter)
         .allowsHitTesting(false)
     }
