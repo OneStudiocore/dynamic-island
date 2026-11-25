@@ -36,31 +36,15 @@ enum LlamaService {
     static func chat(
         baseURL: URL,
         model: String,
-        messages: [(role: String, content: String)],
+        messages: [ChatMessage],
         numCtx: Int = 4096,
         temperature: Double = 0.6,
         onDelta: @escaping @MainActor (String) -> Void,
         onThinking: @escaping @MainActor (String) -> Void = { _ in }
     ) async throws {
-        struct Msg: Encodable { let role: String; let content: String }
-        struct Options: Encodable { let num_ctx: Int; let temperature: Double }
-        struct Body: Encodable {
-            let model: String
-            let messages: [Msg]
-            let stream: Bool
-            let options: Options
-        }
-
-        var req = URLRequest(url: baseURL.appendingPathComponent("api/chat"))
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 120
-        req.httpBody = try JSONEncoder().encode(
-            Body(model: model,
-                 messages: messages.map { Msg(role: $0.role, content: $0.content) },
-                 stream: true,
-                 options: Options(num_ctx: numCtx, temperature: temperature))
-        )
+        let req = try makeRequest(baseURL: baseURL, model: model, messages: messages,
+                                  numCtx: numCtx, temperature: temperature,
+                                  stream: true, maxTokens: nil, apiChat: true)
 
         let (bytes, resp) = try await URLSession.shared.bytes(for: req)
         guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
@@ -82,14 +66,97 @@ enum LlamaService {
         }
     }
 
-    enum LlamaError: LocalizedError {
-        case badStatus(Int)
+    /// 一次性拿完整回复（用于生成追问这种「短、非流式」的请求）
+    static func complete(
+        baseURL: URL,
+        model: String,
+        messages: [ChatMessage],
+        numCtx: Int = 2048,
+        temperature: Double = 0.4,
+        maxTokens: Int = 200,
+        timeout: TimeInterval = 120
+    ) async throws -> String {
+        let req = try makeRequest(baseURL: baseURL, model: model, messages: messages,
+                                  numCtx: numCtx, temperature: temperature,
+                                  stream: false, maxTokens: maxTokens, apiChat: true,
+                                  think: false, timeout: timeout)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+            throw LlamaError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+        struct Full: Decodable { let message: Chunk.Message? }
+        guard let full = try? JSONDecoder().decode(Full.self, from: data) else { return "" }
+        if let text = full.message?.content, !text.isEmpty { return text }
+        // 有些模型即便关了思考仍把短句塞进 thinking，挑其中的问句兜底
+        let thought = full.message?.thinking ?? ""
+        let lines = thought.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.contains("？") || $0.contains("?") }
+        return lines.suffix(3).joined(separator: "\n")
+    }
 
-        var errorDescription: String? {
-            switch self {
-            case .badStatus(let code):
-                return "后端返回 \(code)，检查 Ollama 是否在运行"
-            }
+    private struct MsgBody: Encodable {
+        let role: String
+        let content: String
+        let images: [String]?
+
+        enum CodingKeys: String, CodingKey { case role, content, images }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(role, forKey: .role)
+            try c.encode(content, forKey: .content)
+            if let images, !images.isEmpty { try c.encode(images, forKey: .images) }
+        }
+    }
+
+    private struct Options: Encodable {
+        let num_ctx: Int
+        let temperature: Double
+        let num_predict: Int?
+    }
+
+    private struct Body: Encodable {
+        let model: String
+        let messages: [MsgBody]
+        let stream: Bool
+        let options: Options
+        /// 追问这种一句话任务关掉思考链，否则 content 会被 reasoning 挤空
+        var think: Bool?
+        /// 让模型留驻内存，免得每条追问都要重新加载十几秒
+        var keep_alive: String = "30m"
+    }
+
+    private static func makeRequest(baseURL: URL, model: String, messages: [ChatMessage],
+                                    numCtx: Int, temperature: Double,
+                                    stream: Bool, maxTokens: Int?, apiChat: Bool,
+                                    think: Bool? = nil, timeout: TimeInterval = 120) throws -> URLRequest {
+        var req = URLRequest(url: baseURL.appendingPathComponent("api/chat"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = timeout
+        req.httpBody = try JSONEncoder().encode(
+            Body(model: model,
+                 messages: messages.map {
+                     MsgBody(role: $0.role,
+                             content: $0.text,
+                             images: $0.images.isEmpty ? nil : $0.images.map(ChatImage.stripPrefix))
+                 },
+                 stream: stream,
+                 options: Options(num_ctx: numCtx, temperature: temperature, num_predict: maxTokens),
+                 think: think)
+        )
+        return req
+    }
+}
+
+enum LlamaError: LocalizedError {
+    case badStatus(Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .badStatus(let code):
+            return "后端返回 \(code)"
         }
     }
 }

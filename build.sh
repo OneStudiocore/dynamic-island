@@ -19,6 +19,24 @@ else
   echo "==> 跳过 preview-wallpaper.png（未提供，设置页预览会退回渐变底）"
 fi
 
+if [ -d assets/clouds ]; then
+  cp -R assets/clouds "$APP_DIR/Contents/Resources/clouds"
+else
+  echo "==> 跳过 clouds（云图会退回程序化噪声）"
+fi
+
+if [ -d assets/star ]; then
+  cp -R assets/star "$APP_DIR/Contents/Resources/star"
+else
+  echo "==> 跳过 star（流星会退回自绘光带）"
+fi
+
+if [ -d assets/moons ]; then
+  cp -R assets/moons "$APP_DIR/Contents/Resources/moons"
+else
+  echo "==> 跳过 moons（夜晚会退回圆形光斑）"
+fi
+
 if [ -d assets/logos ]; then
   cp -R assets/logos "$APP_DIR/Contents/Resources/logos"
 else
@@ -41,12 +59,19 @@ swiftc \
   -O \
   -target arm64-apple-macos26.0 \
   -o "$APP_DIR/Contents/MacOS/$EXEC_NAME" \
-  src/*.swift src/Services/*.swift
+  src/*.swift src/Services/*.swift src/Pet/*.swift src/Welcome/*.swift
 
 echo "==> 生成 PkgInfo"
 printf 'APPL????' > "$APP_DIR/Contents/PkgInfo"
 
 echo "==> 临时签名"
-codesign --force --sign - --timestamp=none "$APP_DIR" >/dev/null 2>&1 || true
+# 有开发者证书就用它签：ad-hoc 签名每次重建 cdhash 都变，系统"输入监控"授权会
+# 跟着失效——用户体感就是"监听只好了第一次"。用固定证书签名后授权可以长期保留。
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "Apple Development"; then
+  codesign --force --sign "Apple Development: 13874002@qq.com (V3R2G39K58)" --timestamp=none "$APP_DIR" >/dev/null 2>&1 \
+    || codesign --force --sign - --timestamp=none "$APP_DIR" >/dev/null 2>&1 || true
+else
+  codesign --force --sign - --timestamp=none "$APP_DIR" >/dev/null 2>&1 || true
+fi
 
 echo "==> 完成: $APP_DIR"

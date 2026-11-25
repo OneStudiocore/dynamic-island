@@ -149,12 +149,50 @@ enum CloudChatService {
         let choices: [Choice]
     }
 
-    private struct Msg: Encodable { let role: String; let content: String }
+    private struct ImageURL: Encodable { let url: String }
+    private struct Part: Encodable {
+        let type: String
+        var text: String?
+        var image_url: ImageURL?
+    }
+
+    private struct Msg: Encodable {
+        let role: String
+        let content: String
+        let images: [String]
+
+        enum CodingKeys: String, CodingKey { case role, content }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(role, forKey: .role)
+            if images.isEmpty {
+                try c.encode(content, forKey: .content)
+            } else {
+                var parts: [Part] = []
+                if !content.isEmpty { parts.append(Part(type: "text", text: content)) }
+                for image in images {
+                    parts.append(Part(type: "image_url", image_url: ImageURL(url: image)))
+                }
+                try c.encode(parts, forKey: .content)
+            }
+        }
+    }
+
     private struct Body: Encodable {
         let model: String
         let messages: [Msg]
         let stream: Bool
         let temperature: Double
+        var max_tokens: Int?
+    }
+
+    private struct FullResponse: Decodable {
+        struct Choice: Decodable {
+            struct Message: Decodable { let content: String? }
+            let message: Message?
+        }
+        let choices: [Choice]
     }
 
     private static func root(_ base: String) -> String {
@@ -181,7 +219,7 @@ enum CloudChatService {
     /// 流式对话：OpenAI 兼容 SSE，data: {json} / data: [DONE]
     static func chat(
         provider: CloudProvider,
-        messages: [(role: String, content: String)],
+        messages: [ChatMessage],
         temperature: Double,
         onDelta: @escaping @MainActor (String) -> Void
     ) async throws {
@@ -197,9 +235,10 @@ enum CloudChatService {
         req.timeoutInterval = 120
         req.httpBody = try JSONEncoder().encode(
             Body(model: provider.model,
-                 messages: messages.map { Msg(role: $0.role, content: $0.content) },
+                 messages: messages.map { Msg(role: $0.role, content: $0.text, images: $0.images) },
                  stream: true,
-                 temperature: temperature)
+                 temperature: temperature,
+                 max_tokens: nil)
         )
 
         let (bytes, resp) = try await URLSession.shared.bytes(for: req)
@@ -218,5 +257,38 @@ enum CloudChatService {
                 await onDelta(content)
             }
         }
+    }
+
+    /// 一次性拿完整回复（生成追问这类短请求走这里，不走流式）
+    static func complete(
+        provider: CloudProvider,
+        messages: [ChatMessage],
+        temperature: Double = 0.4,
+        maxTokens: Int = 160
+    ) async throws -> String {
+        guard !provider.apiKey.isEmpty else { throw CloudError.noKey }
+        guard let url = URL(string: root(provider.baseURL) + "/chat/completions") else {
+            throw CloudError.badURL
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("Bearer \(provider.apiKey)", forHTTPHeaderField: "Authorization")
+        req.timeoutInterval = 30
+        req.httpBody = try JSONEncoder().encode(
+            Body(model: provider.model,
+                 messages: messages.map { Msg(role: $0.role, content: $0.text, images: $0.images) },
+                 stream: false,
+                 temperature: temperature,
+                 max_tokens: maxTokens)
+        )
+
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+            throw CloudError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+        guard let full = try? JSONDecoder().decode(FullResponse.self, from: data),
+              let text = full.choices.first?.message?.content else { return "" }
+        return text
     }
 }

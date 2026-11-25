@@ -1,9 +1,10 @@
 import AppKit
 import SwiftUI
 import ServiceManagement
+import UniformTypeIdentifiers
 
 enum IslandPanel: String, CaseIterable, Identifiable {
-    case home, launcher, files, music, timer, clipboard, chat
+    case home, launcher, files, music, timer, clipboard, chat, todo, notes
 
     var id: String { rawValue }
 
@@ -16,6 +17,8 @@ enum IslandPanel: String, CaseIterable, Identifiable {
         case .timer: return "timer"
         case .clipboard: return "doc.on.clipboard"
         case .chat: return "sparkles"
+        case .todo: return "checklist"
+        case .notes: return "note.text"
         }
     }
 
@@ -28,16 +31,25 @@ enum IslandPanel: String, CaseIterable, Identifiable {
         case .timer: return "计时器"
         case .clipboard: return "剪贴板"
         case .chat: return "本地 AI"
+        case .todo: return "待办事项"
+        case .notes: return "速记"
         }
     }
 
     /// 需要加高面板的页签
     var tall: Bool {
         switch self {
-        case .home, .launcher, .files, .chat: return true
+        case .home, .launcher, .files, .chat, .todo, .notes: return true
         case .music, .timer, .clipboard: return false
         }
     }
+}
+
+/// 顶部工具栏浮层菜单
+enum HeaderMenuKind {
+    case none
+    case tabs      // 其余页签
+    case actions   // 摄像头 / 设置 / 关于 / 退出
 }
 
 enum Transient: Equatable {
@@ -65,16 +77,201 @@ struct IslandGeometry: Equatable {
     var bottomRadius: CGFloat
 }
 
+/// 顶部硬件形态：无刘海普通 Mac / 刘海屏 / 灵动岛屏
+enum DeviceKind {
+    case standard
+    case notch
+    case dynamicIsland
+}
+
+/// 显示屏精确档案：原生像素、逻辑点（2x）、顶部形态。
+/// 用于按机型精准适配，保证岛体与屏幕完全契合。
+struct DisplayProfile {
+    let nativeWidth: Int        // 物理像素（横）
+    let nativeHeight: Int       // 物理像素（纵）
+    let pointWidth: CGFloat    // 逻辑点（横）
+    let pointHeight: CGFloat   // 逻辑点（纵）
+    let backingScale: CGFloat
+    let form: DeviceKind
+    let touch: Bool
+
+    /// 已知机型精确档案（按原生像素匹配）
+    static let known: [DisplayProfile] = [
+        // 2026.10 PROLED XDR 触控 + 灵动岛
+        DisplayProfile(nativeWidth: 3024, nativeHeight: 1986, pointWidth: 1512, pointHeight: 993,
+                       backingScale: 2, form: .dynamicIsland, touch: true),
+        DisplayProfile(nativeWidth: 3472, nativeHeight: 2266, pointWidth: 1736, pointHeight: 1133,
+                       backingScale: 2, form: .dynamicIsland, touch: true),
+        // 2026.03 Liquid Retina XDR 刘海（无触控）
+        DisplayProfile(nativeWidth: 3024, nativeHeight: 1964, pointWidth: 1512, pointHeight: 982,
+                       backingScale: 2, form: .notch, touch: false),
+        DisplayProfile(nativeWidth: 3456, nativeHeight: 2234, pointWidth: 1728, pointHeight: 1117,
+                       backingScale: 2, form: .notch, touch: false)
+    ]
+
+    static func match(nativeWidth: Int, nativeHeight: Int) -> DisplayProfile? {
+        known.first { $0.nativeWidth == nativeWidth && $0.nativeHeight == nativeHeight }
+    }
+}
+
 @MainActor
 final class IslandModel: ObservableObject {
-    static let spring = Animation.spring(response: 0.66, dampingFraction: 0.84, blendDuration: 0.3)
+    static let spring = Animation.spring(response: 0.38, dampingFraction: 0.86, blendDuration: 0.22)
     static let quick = Animation.spring(response: 0.46, dampingFraction: 0.88)
+
+    /// 任务岛：本地模型提出的任务与授权单都在这里
+    let taskEngine = TaskEngine()
+    @Published var showTaskShelf = false
+
+    init() {
+        taskEngine.requestKeyboard = { [weak self] in self?.onNeedKeyboard?() }
+        // 调试入口：带这个环境变量启动就直接落在任务层
+        if ProcessInfo.processInfo.environment["ISLAND_TASKS"] == "1" {
+            pinned = true
+            panel = .chat
+            showTaskShelf = true
+        }
+        // 端到端自检：带这个变量启动就自动建一条任务并立刻跑一次
+        if ProcessInfo.processInfo.environment["ISLAND_TASKS_DEMO"] == "1" {
+            let engine = taskEngine
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                engine.draft = "每 5 分钟看看下载文件夹"
+                engine.createFromDraft()
+                if let id = engine.tasks.first?.id { engine.runNow(id) }
+            }
+        }
+        // 自检：拆不干净的句子应该被挂起、进「问豆包」
+        if ProcessInfo.processInfo.environment["ISLAND_TASKS_ASK"] == "1" {
+            let engine = taskEngine
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                engine.draft = "每周备份一下照片"
+                engine.submitDraft()
+            }
+        }
+    }
 
     @Published var screenScale: CGFloat = 1.1
     @Published var windowSize: CGSize = CGSize(width: 760, height: 480)
 
+    // 顶部硬件适配（repositionIsland 时按当前屏幕写入）
+    @Published var deviceKind: DeviceKind = .standard
+    /// 顶部刘海/灵动岛的高度（屏幕逻辑点，未乘 screenScale）
+    @Published var topCutout: CGFloat = 0
+    /// 是否存在顶部遮挡
+    var hasTopCutout: Bool { topCutout > 0.5 }
+
+    /// 机型是否为 MacBook（笔记本：刘海/灵动岛在屏幕顶部，需要把内容向下避让）
+    private static let hardwareIsMacBook = detectMacBook()
+
+    #if DEBUG
+    /// 诊断缝：离屏模拟 MacBook 机型（生产不编译）
+    var debugForceMacBook: Bool? = nil
+    #endif
+
+    var isMacBook: Bool {
+        #if DEBUG
+        if let forced = debugForceMacBook { return forced }
+        #endif
+        return Self.hardwareIsMacBook
+    }
+
+    /// 读取 hw.model 机型标识，如 MacBookPro18,3 / MacBookAir10,1 / Mac14,3
+    private static func detectMacBook() -> Bool {
+        var size = 0
+        sysctlbyname("hw.model", nil, &size, nil, 0)
+        var machine = [CChar](repeating: 0, count: size)
+        sysctlbyname("hw.model", &machine, &size, nil, 0)
+        let model = String(cString: machine)
+        return model.contains("MacBook")
+    }
+
+    // MARK: 顶部形态手动开关（刘海 / 灵动岛）
+
+    /// 开关：打开=强制按刘海适配，关闭=灵动岛（默认，跟随自动检测）
+    @Published var forceNotchMode: Bool = UserDefaults.standard.bool(forKey: "hardware.forceNotch")
+
+    /// 当前屏幕是否支持触控（PROLED XDR 灵动岛机型为 true）。
+    /// 触控没有鼠标悬停，岛体改用点按展开/收起，不依赖 hover。
+    @Published var touchScreen: Bool = false
+
+    func setForceNotch(_ on: Bool) {
+        forceNotchMode = on
+        UserDefaults.standard.set(on, forKey: "hardware.forceNotch")
+    }
+
+    /// 显式收起（触控关闭按钮 / 岛外点击共用）：锁住时不收起
+    func collapse() {
+        guard !locked else { return }
+        collapseWork?.cancel()
+        fullScreenPeek = false
+        withAnimation(Self.spring) {
+            cameraMirrorOpen = false
+            hovered = false
+            pinned = false
+        }
+    }
+
+    /// 全屏时快速双击 Shift：第一次把岛叫出来并展开，再双击收回。
+    /// 只对“全屏 App 里被隐藏”的岛生效，平时双击 Shift 不会有任何动作。
+    func toggleFullScreenPeek() {
+        guard peekOnFullScreen else { return }
+        if fullScreenPeek {
+            fullScreenPeek = false
+            locked = false
+            collapse()
+            return
+        }
+        guard isFullScreenApp else { return }
+        fullScreenPeek = true
+        collapseWork?.cancel()
+        collapseWork = nil
+        expandWork?.cancel()
+        expandWork = nil
+        locked = false
+        pinned = true
+        withAnimation(Self.spring) {
+            hovered = true
+            panel = preferredPanel()
+        }
+        beginMorph()
+    }
+
+    /// 当前生效的顶部形态：手动开关优先，否则用自动检测结果
+    var effectiveDeviceKind: DeviceKind {
+        if forceNotchMode { return .notch }
+        return deviceKind
+    }
+
+    /// 鼠标当前是否停在岛（或展开面板）内
+    var isCursorInside: Bool { cursorInside }
+
+    /// 顶部黑色区域为避开刘海/灵动岛而向下避让的高度（已乘 screenScale，与几何同单位）。
+    /// 刘海形态留一行半（36pt），灵动岛形态留一行（24pt）；系统实际上报更高则取更大值。
+    /// 普通 Mac（standard）为 0；手动开关强制形态时立即生效，不依赖物理机型检测。
+    var notchClearance: CGFloat {
+        let measured: CGFloat = (topCutout + 4) * screenScale
+        switch effectiveDeviceKind {
+        case .notch:
+            return max(36 * screenScale, measured)
+        case .dynamicIsland:
+            return max(24 * screenScale, measured)
+        case .standard:
+            return hasTopCutout ? measured : 0
+        }
+    }
+
+    /// 快捷指令默认文案（{clip} 会替换成剪贴板正文）
+    static let defaultQuickPrompts: [String] = [
+        "总结剪贴板里的内容：{clip}",
+        "把这段翻成英文：{clip}",
+        "给这个主题列个提纲：{clip}",
+        "用三句话解释「{clip}」"
+    ]
+
     @Published var hovered = false
     @Published var pinned = false
+    /// 锁头：锁住后岛固定不消失，岛外点击/鼠标移开都不收起
+    @Published var locked = false
     @Published var transient: Transient?
     @Published var panel: IslandPanel = .home
 
@@ -83,6 +280,13 @@ final class IslandModel: ObservableObject {
     @Published var cpu: Double = 0
     @Published var memory: Double = 0
     @Published var diskFree: String = "—"
+    @Published var netDown: String = "0 K/s"
+    @Published var netUp: String = "0 K/s"
+    /// AI 面板的快捷指令（占位符 {clip} 会被替换成剪贴板正文）
+    @Published var quickPrompts: [String] =
+        UserDefaults.standard.stringArray(forKey: "ai.quickPrompts") ?? IslandModel.defaultQuickPrompts
+    @Published var showQuickPrompts: Bool =
+        UserDefaults.standard.object(forKey: "ai.quickChips") as? Bool ?? true
     @Published var volume: Double = 0.5
     @Published var clipboardItems: [String] = []
     @Published var accent = Color(red: 0.36, green: 0.66, blue: 1.0)
@@ -94,6 +298,8 @@ final class IslandModel: ObservableObject {
         var role: String      // "user" / "assistant"
         var text: String
         var thought: String = ""
+        /// 这一轮用户发的图（data URL），只用于回看缩略图
+        var images: [String] = []
     }
 
     @Published var llamaEndpoint: String =
@@ -106,6 +312,16 @@ final class IslandModel: ObservableObject {
     @Published var chatDraft: String = ""
     @Published var chatBusy = false
     @Published var editingEndpoint = false
+
+    /// 待发送的图片（最多 3 张，data URL）
+    @Published var pendingImages: [String] = []
+    /// 回复完成后自动生成的追问建议
+    @Published var followUps: [String] = []
+    @Published var followUpsLoading = false
+    /// 输入行左侧附件菜单是否展开
+    @Published var showAttachMenu = false
+    /// 发图时若当前模型不带视觉，会自动换成视觉模型，这里留一句说明给界面
+    @Published var visionNotice: String?
 
     // MARK: 云端 AI
     @Published var cloudProviders: [CloudProvider] = IslandModel.loadCloudProviders()
@@ -133,18 +349,13 @@ final class IslandModel: ObservableObject {
 
     // 卡片本地 UI 状态（当前编译环境无 SwiftUI 宏，不能用 @State，统一放 model）
     @Published var cloudShowKey: Set<UUID> = []
-    @Published var cloudFetched: [UUID: [String]] = [:]
-    @Published var cloudLoading: Set<UUID> = []
-    @Published var cloudMessage: [UUID: String] = [:]
 
     // 自绘模型下拉
     @Published var showModelPicker = false
-    /// 运行时通过 /models 拉取到的云端模型（按服务商 id 缓存）
-    @Published var cloudModelsCache: [UUID: [String]] = [:]
+    /// 标签栏「更多」是否展开（放不下的标签点对号后再显示第二行）
 
-    /// 某服务商在下拉里要展示的全部模型：优先拉取结果，其次预设常见清单，最后当前模型
+    /// 某服务商在下拉里要展示的全部模型：优先预设常见清单，其次当前模型
     func availableModels(_ provider: CloudProvider) -> [String] {
-        if let cached = cloudModelsCache[provider.id], !cached.isEmpty { return cached }
         if let pid = provider.presetId,
            let preset = CloudPresets.all.first(where: { $0.id == pid }) {
             return preset.knownModels
@@ -169,20 +380,6 @@ final class IslandModel: ObservableObject {
     }
 
     /// 有 Key 时拉取并缓存某服务商的全模型
-    func loadCloudModels(_ provider: CloudProvider) {
-        guard !provider.apiKey.isEmpty, !cloudLoading.contains(provider.id) else { return }
-        cloudLoading.insert(provider.id)
-        Task { @MainActor in
-            do {
-                let list = try await CloudChatService.models(provider: provider)
-                cloudModelsCache[provider.id] = list
-            } catch {
-                cloudMessage[provider.id] = (error as? LocalizedError)?.errorDescription
-            }
-            cloudLoading.remove(provider.id)
-        }
-    }
-
     func toggleCloudKeyVisible(_ id: UUID) {
         if cloudShowKey.contains(id) { cloudShowKey.remove(id) } else { cloudShowKey.insert(id) }
     }
@@ -196,6 +393,33 @@ final class IslandModel: ObservableObject {
     @Published var noteDraft = ""
     @Published var stashedFiles: [StashedFile] = []
     @Published var dropTargeted = false
+    @Published var airDropTargeted = false
+
+    // 待办事项
+    @Published var todos: [TodoItem] = []
+    @Published var todoDraft = ""
+
+    // 速记草稿
+    @Published var scratchpad: String = StashStore.shared.scratchpad
+
+    // 摄像头镜子
+    @Published var cameraMirrorOpen = false
+    @Published var cameraDenied = false
+    /// 系统相机授权弹窗正在显示，此时点“允许/拒绝”的全局点击不应被当成岛外点击而收起
+    @Published var cameraAuthInFlight = false
+
+    // 健康提醒（开关与间隔，UserDefaults 持久化）
+    @Published var waterReminderOn: Bool =
+        UserDefaults.standard.object(forKey: "health.waterOn") as? Bool ?? false
+    @Published var waterReminderInterval: Double =
+        UserDefaults.standard.object(forKey: "health.waterInterval") as? Double ?? 60
+    @Published var sedentaryReminderOn: Bool =
+        UserDefaults.standard.object(forKey: "health.sedentaryOn") as? Bool ?? false
+    @Published var sedentaryReminderInterval: Double =
+        UserDefaults.standard.object(forKey: "health.sedentaryInterval") as? Double ?? 50
+    private var lastWaterAt = Date()
+    private var lastActiveAt = Date()
+    private var lastTransientAt = Date()
 
     // MARK: 可持久化设置
     @Published var compactRatio: Double =
@@ -227,6 +451,16 @@ final class IslandModel: ObservableObject {
         UserDefaults.standard.object(forKey: "ui.compactHeight") as? Double ?? 36
     @Published var hiddenTabs: [String] =
         UserDefaults.standard.stringArray(forKey: "ui.hiddenTabs") ?? []
+    /// 顶部第一行常驻的主标签数量（其余收进「更多」菜单，避免按钮堆成一片）
+    @Published var primaryTabCount: Int =
+        UserDefaults.standard.object(forKey: "ui.primaryTabs") as? Int ?? 5
+    /// 顶部是否显示日期
+    @Published var showHeaderDate: Bool =
+        UserDefaults.standard.object(forKey: "ui.headerDate") as? Bool ?? true
+    /// 顶部当前展开的浮层菜单
+    @Published var headerMenu: HeaderMenuKind = .none
+    /// 主页宫格里当前悬停的格子
+    @Published var hoveredTile: IslandPanel?
     @Published var weatherCity: String =
         UserDefaults.standard.string(forKey: "weather.city") ?? "沈阳"
     @Published var weatherLat: Double =
@@ -250,6 +484,11 @@ final class IslandModel: ObservableObject {
     /// 全屏 App 时自动隐藏灵动岛
     @Published var hideOnFullScreen: Bool =
         UserDefaults.standard.object(forKey: "dnd.fullscreen") as? Bool ?? true
+    /// 全屏时快速双击 Shift 呼出（再双击收回）
+    @Published var peekOnFullScreen: Bool =
+        UserDefaults.standard.object(forKey: "peek.shift") as? Bool ?? true
+    /// 全屏里被 Shift「叫出来」的临时状态：为真时即使全屏隐藏也把窗口显示出来
+    @Published var fullScreenPeek = false
     /// 免打扰时段开关
     @Published var dndScheduleEnabled: Bool =
         UserDefaults.standard.object(forKey: "dnd.schedule") as? Bool ?? false
@@ -340,7 +579,7 @@ final class IslandModel: ObservableObject {
         UserDefaults.standard.object(forKey: "tune.clickOutside") as? Bool ?? true
     /// 悬停展开延迟（秒）
     @Published var hoverExpandDelay: Double =
-        UserDefaults.standard.object(forKey: "tune.hoverDelay") as? Double ?? 0.0
+        UserDefaults.standard.object(forKey: "tune.hoverDelay") as? Double ?? 0.08
     /// 收起延迟（秒）
     @Published var collapseDelay: Double =
         UserDefaults.standard.object(forKey: "tune.collapseDelay") as? Double ?? 0.35
@@ -350,12 +589,23 @@ final class IslandModel: ObservableObject {
     /// 剪贴板自动去重
     @Published var clipboardDedup: Bool =
         UserDefaults.standard.object(forKey: "tune.clipDedup") as? Bool ?? true
+    /// 主页迷你卡最多显示几条：待办
+    @Published var todoVisibleCount: Int =
+        UserDefaults.standard.object(forKey: "ui.todoVisible") as? Int ?? 2
+    /// 主页迷你卡最多显示几条：最近笔记
+    @Published var noteVisibleCount: Int =
+        UserDefaults.standard.object(forKey: "ui.noteVisible") as? Int ?? 2
+    /// 主页迷你卡最多显示几条：文件暂存
+    @Published var fileVisibleCount: Int =
+        UserDefaults.standard.object(forKey: "ui.fileVisible") as? Int ?? 2
     /// 番茄钟默认时长（分钟）
     @Published var pomodoroDefaultMinutes: Double =
         UserDefaults.standard.object(forKey: "tune.pomoDefault") as? Double ?? 25
     /// 番茄钟短休息时长（分钟）
     @Published var pomodoroBreakMinutes: Double =
         UserDefaults.standard.object(forKey: "tune.pomoBreak") as? Double ?? 5
+    /// 番茄钟时长选择浮层是否展开（临时状态，不持久化）
+    @Published var pomodoroSheet: Bool = false
     /// 计时结束播放提示音
     @Published var timerSoundEnabled: Bool =
         UserDefaults.standard.object(forKey: "tune.timerSound") as? Bool ?? true
@@ -408,7 +658,7 @@ final class IslandModel: ObservableObject {
     @Published private(set) var morphing = false
     private var morphWork: DispatchWorkItem?
 
-    func beginMorph(_ seconds: Double = 0.75) {
+    func beginMorph(_ seconds: Double = 0.95) {
         morphWork?.cancel()
         if !morphing { morphing = true }
         let work = DispatchWorkItem { [weak self] in self?.morphing = false }
@@ -424,10 +674,38 @@ final class IslandModel: ObservableObject {
                       height: g.size.height)
     }
 
+    /// 悬停判定的边缘缓冲（点）：展开后鼠标要超出视觉边缘这么多才算离开，
+    /// 用迟滞打破「在边缘反复进/出」的放大缩小抖动。
+    let hoverEdgeMargin: CGFloat = 14
+
+    /// 供 hosting 视图判断光标是否算悬停（含迟滞边距），坐标为窗口视图点
+    func isHoverPointInside(_ p: CGPoint) -> Bool {
+        let m: CGFloat = expanded ? hoverEdgeMargin : 0
+        return hitRect.insetBy(dx: -m, dy: -m).contains(p)
+    }
+
+    /// 锁头圆按钮的边长（点）
+    var lockSize: CGFloat { 22 * screenScale }
+
+    /// 锁头在窗口视图坐标下的命中框（浮在面板右下角外侧）；收起时为零
+    var lockRect: CGRect {
+        guard expanded else { return .zero }
+        let ls = lockSize
+        let h = hitRect
+        let center = CGPoint(x: h.maxX + ls * 0.35, y: h.maxY + ls * 0.15)
+        return CGRect(x: center.x - ls / 2, y: center.y - ls / 2, width: ls, height: ls)
+    }
+
     /// 收起小岛用的更小缩放（展开面板保持 screenScale 原尺寸）
     var compactScale: CGFloat { screenScale * CGFloat(compactRatio) }
 
+    // 离屏逐帧录制：用外部计算好的几何覆盖真实几何，并关闭隐式动画，保证逐帧确定
+    var snapshotMode = false
+    var snapshotOverride: IslandGeometry?
+    var snapshotHideLock = false
+
     var geometry: IslandGeometry {
+        if let o = snapshotOverride { return o }
         // 展开态：标准面板 404×192；启动台 / AI 对话单独放大，看得清
         if expanded && transient == nil {
             let base = CGFloat(panelWidth)
@@ -443,14 +721,26 @@ final class IslandModel: ObservableObject {
             case .files:
                 w = base + 56           // 460
                 h = 340
+            case .todo:
+                h = 360
+            case .notes:
+                h = 360
             case .home:
-                h = 372
+                h = 452
             case .music, .timer, .clipboard:
                 break
             }
             let k = CGFloat(panelScale)
-            let size = CGSize(width: w * k * screenScale, height: h * k * screenScale)
+            // MacBook 刘海/灵动岛避让：面板向下长，顶部仍贴边，内容同步下推
+            let extraH = notchClearance
+            let headerExtra: CGFloat = 0
+            let size = CGSize(width: w * k * screenScale,
+                              height: h * k * screenScale + extraH + headerExtra)
             let radius = min(CGFloat(cornerRadius), h * k / 2) * screenScale
+            // 刘海形态：贴住屏幕最顶（无 topInset），上圆角为 0 像真刘海；灵动岛形态悬浮全圆角
+            if effectiveDeviceKind == .notch {
+                return IslandGeometry(size: size, topInset: 0, topRadius: 0, bottomRadius: radius)
+            }
             return IslandGeometry(size: size, topInset: 8 * screenScale, topRadius: radius, bottomRadius: radius)
         }
 
@@ -462,6 +752,8 @@ final class IslandModel: ObservableObject {
 
         let baseW = CGFloat(compactWidth)
         let baseH = CGFloat(compactHeight)
+        // 刘海形态（仅静态收起态，HUD 临时态仍用胶囊）：贴顶、上圆角为 0、整体加宽
+        let notchForm = effectiveDeviceKind == .notch && transient == nil
 
         switch transient {
         case .volume:
@@ -478,12 +770,17 @@ final class IslandModel: ObservableObject {
             } else if nowPlaying != nil {
                 w = baseW + 120; h = baseH
             } else {
-                w = baseW; h = baseH
+                w = notchForm ? baseW + 44 : baseW; h = baseH
             }
         }
         r = h / 2
 
         let size = CGSize(width: w * c, height: h * c)
+        if notchForm {
+            // 真刘海：贴住屏幕最顶（无 topInset），上圆角 0，底部保留小圆角
+            let bottomR = min(10, h / 2) * c
+            return IslandGeometry(size: size, topInset: 0, topRadius: 0, bottomRadius: bottomR)
+        }
         let radius = r * c
         return IslandGeometry(size: size, topInset: CGFloat(compactTopInset) * c, topRadius: radius, bottomRadius: radius)
     }
@@ -493,6 +790,7 @@ final class IslandModel: ObservableObject {
     func start() {
         notes = StashStore.shared.notes
         stashedFiles = StashStore.shared.files
+        todos = StashStore.shared.todos
         LauncherService.shared.loadIfNeeded()
         launchApps = LauncherService.shared.apps
         refreshWeather()
@@ -517,10 +815,14 @@ final class IslandModel: ObservableObject {
         }
         if tickCount % 2 == 0 { refreshVolume() }
         if tickCount % 4 == 0 { pollNowPlaying() }
-        if tickCount % 8 == 0 { refreshStats() }
+        if tickCount % 4 == 0 { refreshStats() }
         if tickCount % 240 == 0 { refreshWeather() }
         if tickCount % 3 == 0 { pollClipboard() }
+        if tickCount % 4 == 0 { checkHealthReminders() }
     }
+
+    /// 真实输入（鼠标/键盘）时调用，用于久坐计时复位
+    func markUserActivity() { lastActiveAt = Date() }
 
     // MARK: - 展开 / 收起
 
@@ -551,11 +853,13 @@ final class IslandModel: ObservableObject {
         } else {
             expandWork?.cancel()
             expandWork = nil
+            guard !locked else { return }          // 锁住时鼠标移开也不收起
+            guard !cameraMirrorOpen else { return } // 镜子打开时鼠标移开不收起，只能叉掉或点外面
             guard !forceExpanded else { return }
             guard hovered else { return }        // 已经收起了
             guard collapseWork == nil else { return }  // 已在排队，别反复重排
             let work = DispatchWorkItem { [weak self] in
-                guard let self, !self.blockingCollapse else { return }
+                guard let self, !self.locked, !self.blockingCollapse, !self.fullScreenPeek else { return }
                 withAnimation(Self.spring) {
                     self.hovered = false
                     self.pinned = false
@@ -596,6 +900,20 @@ final class IslandModel: ObservableObject {
         }
     }
 
+    /// 锁头：锁住固定不消失；解锁后按光标位置决定是否收起
+    func toggleLock() {
+        withAnimation(Self.quick) {
+            locked.toggle()
+            if locked {
+                hovered = true
+                pinned = true
+            } else {
+                pinned = false
+                if !cursorInside { hovered = false }
+            }
+        }
+    }
+
     /// 全局快捷键触发：展开 / 收起明确切换，不依赖鼠标当前位置
     func hotKeyToggle() {
         collapseWork?.cancel()
@@ -613,10 +931,20 @@ final class IslandModel: ObservableObject {
 
     func select(_ p: IslandPanel) {
         withAnimation(Self.spring) { panel = p }
+        headerMenu = .none
         if p == .chat {
             pinned = true          // 提问时别被鼠标移出收起来
             onNeedKeyboard?()      // 让窗口拿到键盘焦点
             if llamaModels.isEmpty { refreshLlamaModels() }
+        }
+    }
+
+    /// 带着文件拖进岛时：自动展开并直接跳到文件栏（空手悬停不走这里）
+    func presentFilesForDrop() {
+        guard !expanded || panel != .files else { return }
+        withAnimation(Self.quick) {
+            hovered = true
+            panel = .files
         }
     }
 
@@ -667,13 +995,18 @@ final class IslandModel: ObservableObject {
 
     func sendChat() {
         let text = chatDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !chatBusy else { return }
+        let images = pendingImages
+        guard (!text.isEmpty || !images.isEmpty), !chatBusy else { return }
+        visionNotice = nil
+
+        // 只发图不打字时给一句默认问法，避免空 prompt
+        let prompt = text.isEmpty ? "看看这张图，你看到什么？" : text
 
         // 云端分支
         if let cloud = activeCloudProvider {
             guard !cloud.apiKey.isEmpty else { llamaError = "先填 API Key"; return }
             guard !cloud.model.isEmpty else { llamaError = "先选或填一个模型"; return }
-            runChat(text: text) { history in
+            runChat(text: prompt, images: images) { history in
                 try await CloudChatService.chat(
                     provider: cloud, messages: history, temperature: self.aiTemperature,
                     onDelta: { delta in
@@ -686,12 +1019,21 @@ final class IslandModel: ObservableObject {
 
         // 本地 llama 分支
         guard let base = LlamaService.baseURL(llamaEndpoint) else { return }
-        let chosen = llamaModel.isEmpty ? (llamaModels.first ?? "") : llamaModel
+        var chosen = llamaModel.isEmpty ? (llamaModels.first ?? "") : llamaModel
         guard !chosen.isEmpty else {
             llamaError = "先选一个模型"
             return
         }
-        runChat(text: text) { history in
+        // 带图但当前模型看不了图时，自动换成列表里的视觉模型，别让模型瞎编
+        if !images.isEmpty, !Self.isVisionModel(chosen) {
+            if let vision = llamaModels.first(where: { Self.isVisionModel($0) }) {
+                visionNotice = "已临时改用视觉模型 \(vision)"
+                chosen = vision
+            } else {
+                visionNotice = "当前模型看不了图，装一个带 vl 的模型就能识图"
+            }
+        }
+        runChat(text: prompt, images: images) { history in
             try await LlamaService.chat(
                 baseURL: base, model: chosen, messages: history,
                 numCtx: self.aiNumCtx, temperature: self.aiTemperature,
@@ -708,16 +1050,42 @@ final class IslandModel: ObservableObject {
         }
     }
 
+    /// 名字里带 vl / vision / llava 的才算能看图
+    static func isVisionModel(_ name: String) -> Bool {
+        let lower = name.lowercased()
+        // gemma3/4 这类本身也带视觉，一并算进去，免得误报"看不了图"
+        return ["vl", "vision", "llava", "minicpm", "gemma", "moondream", "pixtral", "internvl", "llama3.2"]
+            .contains { lower.contains($0) }
+    }
+
+    /// 从 "qwen3.5:9b" / "gemma4:e2b" 的冒号后半段抠数字，用来挑最轻的模型
+    private static func modelWeight(_ name: String) -> Int {
+        let lower = name.lowercased()
+        let tail = lower.split(separator: ":").last.map(String.init) ?? lower
+        let digits = tail.filter { $0.isNumber }
+        return Int(digits) ?? 999
+    }
+
+    /// 点追问建议：直接变成下一条提问
+    func sendFollowUp(_ text: String) {
+        guard !chatBusy else { return }
+        chatDraft = text
+        sendChat()
+    }
+
     /// 聊天的公共流程：追加用户/助手占位、构造历史、执行请求闭包并处理状态
-    private func runChat(text: String,
-                         request: @escaping ([(role: String, content: String)]) async throws -> Void) {
+    private func runChat(text: String, images: [String] = [],
+                         request: @escaping ([ChatMessage]) async throws -> Void) {
         chatDraft = ""
+        pendingImages.removeAll()
+        showAttachMenu = false
+        followUps.removeAll()
+        followUpsLoading = false
         chatBusy = true
         pinned = true
-        chatTurns.append(.init(role: "user", text: text))
+        chatTurns.append(.init(role: "user", text: text, images: images))
         chatTurns.append(.init(role: "assistant", text: ""))
-        let history = chatTurns.dropLast().suffix(aiHistoryTurns)
-            .map { (role: $0.role, content: $0.text) }
+        let history = buildHistory()
 
         Task {
             do {
@@ -732,8 +1100,204 @@ final class IslandModel: ObservableObject {
                 }
             }
             chatBusy = false
+
+            // 回复落地后再生成追问，失败静默
+            let answer = chatTurns.last?.text ?? ""
+            if !answer.isEmpty, !answer.hasPrefix("（") {
+                followUpsLoading = true
+                let items = await makeFollowUps(question: text, answer: answer)
+                // 期间若用户又发了新消息，就别把旧追问贴上去
+                if chatTurns.last?.text == answer, !chatBusy { followUps = items }
+                followUpsLoading = false
+            }
             collapseIfIdleAndAway()
         }
+    }
+
+    /// 组历史：system 里带灵动岛实时数据；只有最新一轮保留图片，旧的用占位文字省 token
+    private func buildHistory() -> [ChatMessage] {
+        var out: [ChatMessage] = [ChatMessage("system", islandContextSystem())]
+        let turns = Array(chatTurns.dropLast().suffix(aiHistoryTurns))
+        for (i, t) in turns.enumerated() {
+            var msg = ChatMessage(t.role, t.text.isEmpty ? "…" : t.text)
+            if !t.images.isEmpty {
+                if i == turns.count - 1, t.role == "user" {
+                    msg.images = t.images
+                } else {
+                    msg.text = "〔用户发过一张图片〕\n" + msg.text
+                }
+            }
+            out.append(msg)
+        }
+        return out
+    }
+
+    /// 把灵动岛里的东西读成一段话塞进 system：问待办/笔记/暂存/剪贴板/计时器都能直接答
+    func islandContextSystem() -> String {
+        var parts: [String] = []
+        parts.append("你是「灵动岛」这个 Mac 顶部小工具内置的随身助理。回答用中文，短句，默认控制在 100 字内，除非用户要求展开。")
+        parts.append("下面是你现在能直接看到的、用户灵动岛里的实时数据。用户问起这些内容时，直接依据数据回答，不要说看不到，也不要编造数据里没有的东西。")
+
+        let now = DateFormatter()
+        now.locale = Locale(identifier: "zh_CN")
+        now.dateFormat = "M月d日 EEEE HH:mm"
+        parts.append("现在：" + now.string(from: Date()))
+
+        // 待办
+        let undone = todos.filter { !$0.done }
+        if todos.isEmpty {
+            parts.append("待办：空")
+        } else {
+            let list = todos.prefix(10).map { ($0.done ? "✓ " : "○ ") + $0.title }.joined(separator: "｜")
+            parts.append("待办（未完成 \(undone.count) / 共 \(todos.count)）：" + list)
+        }
+
+        // 笔记
+        if notes.isEmpty {
+            parts.append("速记笔记：空")
+        } else {
+            let list = notes.prefix(5).map { "「" + String($0.text.replacingOccurrences(of: "\n", with: " ").prefix(60)) + "」" }
+                .joined(separator: " ")
+            parts.append("速记笔记（\(notes.count) 条，最近）：" + list)
+        }
+
+        // 文件暂存
+        if stashedFiles.isEmpty {
+            parts.append("文件暂存：空")
+        } else {
+            parts.append("文件暂存（\(stashedFiles.count) 个）：" + stashedFiles.prefix(6).map(\.name).joined(separator: "｜"))
+        }
+
+        // 剪贴板
+        if clipboardItems.isEmpty {
+            parts.append("剪贴板历史：空")
+        } else {
+            let list = clipboardItems.prefix(3)
+                .map { "「" + String($0.replacingOccurrences(of: "\n", with: " ").prefix(50)) + "」" }
+                .joined(separator: " ")
+            parts.append("剪贴板最近 \(clipboardItems.count) 条：" + list)
+        }
+
+        // 计时器
+        let remain = Int(ceil(timer.remaining))
+        if timer.running {
+            parts.append("番茄钟：进行中，还剩 \(remain / 60) 分 \(remain % 60) 秒")
+        } else if timer.remaining > 0, timer.remaining < timer.total {
+            parts.append("番茄钟：暂停中，还剩 \(remain / 60) 分 \(remain % 60) 秒")
+        } else {
+            parts.append("番茄钟：未开始（默认 \(Int(pomodoroDefaultMinutes)) 分钟专注 / \(Int(pomodoroBreakMinutes)) 分钟休息）")
+        }
+
+        // 天气
+        if let w = weather, !w.city.isEmpty {
+            parts.append("天气：\(w.city) \(w.temp)°，今天 \(w.low)°~\(w.high)°")
+        }
+
+        parts.append("用户可能在对话里发图片，先读懂图里的文字和界面再回答。")
+        return parts.joined(separator: "\n")
+    }
+
+    /// 让模型自己给 3 个「接着问什么」，只发一问一答的摘要，省 token
+    private func makeFollowUps(question: String, answer: String) async -> [String] {
+        let probe: [ChatMessage] = [
+            ChatMessage("system", "根据对话，写出用户最可能接着追问的 3 个问题。只输出 3 行纯文本，每行一个问题，每行不超过 14 个字，不要编号、不要引号、不要句末标点。"),
+            ChatMessage("user", "我问：\(String(question.prefix(160)))\n你答：\(String(answer.prefix(320)))")
+        ]
+
+        do {
+            let raw: String
+            if let cloud = activeCloudProvider {
+                raw = try await CloudChatService.complete(provider: cloud, messages: probe,
+                                                          temperature: 0.5, maxTokens: 200)
+                return Self.parseFollowUps(raw)
+            }
+            guard let base = LlamaService.baseURL(llamaEndpoint) else { return [] }
+
+            // 先用当前聊天模型；它是视觉模型或抽风时，退到列表里最轻的纯文本模型再试一次
+            var candidates: [String] = []
+            let current = llamaModel.isEmpty ? (llamaModels.first ?? "") : llamaModel
+            if !current.isEmpty { candidates.append(current) }
+            // 视觉模型答"写三个反问句"这类活容易空转，另备一个最轻的纯文本模型兜底
+            if Self.isVisionModel(current) {
+                let texts = llamaModels.filter { !Self.isVisionModel($0) && $0 != current }
+                    .sorted { Self.modelWeight($0) < Self.modelWeight($1) }
+                if let light = texts.first { candidates.append(light) }
+            }
+            guard !candidates.isEmpty else { return [] }
+
+            for model in candidates.prefix(2) {
+                // num_ctx 必须和聊天一致，否则 Ollama 会把模型重载一遍，追问要等十几秒
+                if let out = try? await LlamaService.complete(baseURL: base, model: model, messages: probe,
+                                                              numCtx: self.aiNumCtx, temperature: 0.5,
+                                                              maxTokens: 100, timeout: 45) {
+                    let parsed = Self.parseFollowUps(out)
+                    if !parsed.isEmpty { return parsed }
+                }
+            }
+            return []
+        } catch {
+            return []
+        }
+    }
+
+    /// 清掉编号、引号、空行，留下 2~3 条像人话的短问题
+    static func parseFollowUps(_ raw: String) -> [String] {
+        var items: [String] = []
+        for line in raw.components(separatedBy: .newlines) {
+            var t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty else { continue }
+            // 去掉 "1." "1、" "-" "•" "Q:" 之类前缀
+            t = t.replacingOccurrences(of: #"^[\-\*•\s]+"#, with: "", options: .regularExpression)
+            t = t.replacingOccurrences(of: #"^[0-9一二三四五六七八九十]+[\.、\)]?\s*"#, with: "", options: .regularExpression)
+            t = t.replacingOccurrences(of: #"^(Q|q|问)[:：]\s*"#, with: "", options: .regularExpression)
+            t = t.trimmingCharacters(in: CharacterSet(charactersIn: "「」\"'“”。？?！!：: "))
+            guard t.count >= 2, t.count <= 24 else { continue }
+            guard !items.contains(t) else { continue }
+            items.append(t)
+            if items.count == 3 { break }
+        }
+        return items
+    }
+
+    // MARK: - 图片附件
+
+    var clipboardHasImage: Bool {
+        let pb = NSPasteboard.general
+        return pb.data(forType: .png) != nil || pb.data(forType: .tiff) != nil
+    }
+
+    func attachFromPasteboard() {
+        showAttachMenu = false
+        guard let dataURL = ChatImage.fromPasteboard() else {
+            llamaError = "剪贴板里没有图片"
+            return
+        }
+        appendPendingImage(dataURL)
+    }
+
+    func pickImageFiles() {
+        showAttachMenu = false
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.prompt = "添加"
+        panel.message = "选择要发给 AI 的图片"
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls.prefix(max(0, 3 - pendingImages.count)) {
+            if let dataURL = ChatImage.dataURL(fromFile: url) { appendPendingImage(dataURL) }
+        }
+    }
+
+    func appendPendingImage(_ dataURL: String) {
+        guard pendingImages.count < 3, !pendingImages.contains(dataURL) else { return }
+        pendingImages.append(dataURL)
+    }
+
+    func removePendingImage(_ index: Int) {
+        guard pendingImages.indices.contains(index) else { return }
+        pendingImages.remove(at: index)
     }
 
     func clearChat() {
@@ -774,18 +1338,6 @@ final class IslandModel: ObservableObject {
     func setActiveCloud(_ id: UUID?) {
         activeCloudID = id
         UserDefaults.standard.set(id?.uuidString, forKey: "cloud.active")
-    }
-
-    /// 拉取某服务商的模型并回填，返回模型列表供 UI 选择
-    func refreshCloudModels(_ provider: CloudProvider) async throws -> [String] {
-        let models = try await CloudChatService.models(provider: provider)
-        if let idx = cloudProviders.firstIndex(where: { $0.id == provider.id }) {
-            if cloudProviders[idx].model.isEmpty || !models.contains(cloudProviders[idx].model) {
-                cloudProviders[idx].model = models.first ?? ""
-            }
-            persistCloudProviders()
-        }
-        return models
     }
 
     private func persistCloudProviders() {
@@ -919,6 +1471,29 @@ final class IslandModel: ObservableObject {
         cpu = SystemStats.shared.cpuUsage()
         memory = SystemStats.shared.memoryUsage()
         diskFree = SystemStats.shared.diskFree()
+
+        NetworkStats.shared.sample()
+        netDown = NetworkStats.pretty(NetworkStats.shared.downPerSec)
+        netUp = NetworkStats.pretty(NetworkStats.shared.upPerSec)
+    }
+
+    /// 快捷指令：{clip} 自动带入剪贴板正文，没有内容就用指令原样问
+    func runQuickPrompt(_ prompt: String) {
+        var text = prompt
+        if prompt.contains("{clip}") {
+            let clip = (NSPasteboard.general.string(forType: .string) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if clip.isEmpty {
+                text = prompt
+                    .replacingOccurrences(of: "：{clip}", with: "")
+                    .replacingOccurrences(of: "{clip}", with: "")
+            } else {
+                text = prompt.replacingOccurrences(of: "{clip}", with: String(clip.prefix(1500)))
+            }
+        }
+        chatDraft = text
+        pinned = true
+        sendChat()
     }
 
     // MARK: - 剪贴板
@@ -975,11 +1550,6 @@ final class IslandModel: ObservableObject {
 
     // MARK: - 启动台
 
-    func reloadApps() {
-        LauncherService.shared.loadIfNeeded()
-        launchApps = LauncherService.shared.apps
-    }
-
     func launch(_ app: LauncherApp) {
         LauncherService.shared.launch(app)
         showTransient(.notice("正在打开 \(app.name)"), duration: 1.4)
@@ -1010,10 +1580,109 @@ final class IslandModel: ObservableObject {
         notes = StashStore.shared.notes
     }
 
-    func deleteNote(_ note: QuickNote) {
-        StashStore.shared.removeNote(note)
-        notes = StashStore.shared.notes
+    // MARK: - 待办事项
+
+    func addTodo() {
+        guard StashStore.shared.addTodo(todoDraft) else { return }
+        todoDraft = ""
+        todos = StashStore.shared.todos
     }
+
+    func toggleTodo(_ item: TodoItem) {
+        StashStore.shared.toggleTodo(item)
+        todos = StashStore.shared.todos
+    }
+
+    func deleteTodo(_ item: TodoItem) {
+        StashStore.shared.removeTodo(item)
+        todos = StashStore.shared.todos
+    }
+
+    func clearDoneTodos() {
+        StashStore.shared.clearDoneTodos()
+        todos = StashStore.shared.todos
+    }
+
+    /// 速记内容变化即自动保存
+    func updateScratchpad(_ text: String) {
+        scratchpad = text
+        StashStore.shared.saveScratchpad(text)
+    }
+
+    // MARK: - 摄像头镜子
+
+    func openCameraMirror() {
+        cameraDenied = false
+        cameraAuthInFlight = false
+        withAnimation(Self.quick) {
+            cameraMirrorOpen = true
+            hovered = true
+        }
+    }
+
+    func openCameraPrivacySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    func closeCameraMirror() {
+        withAnimation(Self.quick) {
+            cameraMirrorOpen = false
+            // 光标已不在岛里、也没锁定，就顺手收起，让它真正“消失”
+            if !cursorInside && !locked {
+                hovered = false
+                pinned = false
+            }
+        }
+    }
+
+    // MARK: - 健康提醒
+
+    func setWaterReminder(on: Bool) {
+        waterReminderOn = on
+        UserDefaults.standard.set(on, forKey: "health.waterOn")
+        lastWaterAt = Date()
+    }
+
+    func setWaterInterval(_ v: Double) {
+        waterReminderInterval = v
+        UserDefaults.standard.set(v, forKey: "health.waterInterval")
+        lastWaterAt = Date()
+    }
+
+    func setSedentaryReminder(on: Bool) {
+        sedentaryReminderOn = on
+        UserDefaults.standard.set(on, forKey: "health.sedentaryOn")
+        lastActiveAt = Date()
+    }
+
+    func setSedentaryInterval(_ v: Double) {
+        sedentaryReminderInterval = v
+        UserDefaults.standard.set(v, forKey: "health.sedentaryInterval")
+        lastActiveAt = Date()
+    }
+
+    func checkHealthReminders(now: Date = Date()) {
+        if waterReminderOn {
+            if now.timeIntervalSince(lastWaterAt) >= waterReminderInterval * 60 {
+                showTransient(.notice("该喝水啦，补充一杯水吧"), duration: 2.2)
+                lastWaterAt = now
+            }
+        }
+        if sedentaryReminderOn {
+            if now.timeIntervalSince(lastActiveAt) >= sedentaryReminderInterval * 60 {
+                showTransient(.notice("坐太久啦，起来活动一下"), duration: 2.2)
+                lastActiveAt = now
+            }
+        }
+    }
+
+    #if DEBUG
+    func debugSetHealthBaseline(water: Date, active: Date) {
+        lastWaterAt = water; lastActiveAt = active
+    }
+    #endif
 
     // MARK: - 文件暂存
 
@@ -1041,6 +1710,27 @@ final class IslandModel: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([StashStore.shared.directory])
     }
 
+    /// 隔空投送：优先投已暂存文件；没有则先选文件再投
+    func airDrop(urls provided: [URL]? = nil) {
+        var urls = provided ?? stashedFiles.map { $0.url }
+        if urls.isEmpty {
+            let panel = NSOpenPanel()
+            panel.allowsMultipleSelection = true
+            panel.canChooseDirectories = true
+            panel.canChooseFiles = true
+            panel.prompt = "隔空投送"
+            panel.message = "选择要隔空投送的文件或文件夹"
+            guard panel.runModal() == .OK else { return }
+            urls = panel.urls
+        }
+        guard !urls.isEmpty else { return }
+        if let service = NSSharingService(named: .sendViaAirDrop) {
+            service.perform(withItems: urls)
+        } else {
+            showTransient(.notice("这台 Mac 不支持隔空投送"), duration: 1.6)
+        }
+    }
+
     // MARK: - 设置
 
     func saveSettings() {
@@ -1056,14 +1746,19 @@ final class IslandModel: ObservableObject {
         d.set(compactWidth, forKey: "ui.compactWidth")
         d.set(compactHeight, forKey: "ui.compactHeight")
         d.set(hiddenTabs, forKey: "ui.hiddenTabs")
+        d.set(primaryTabCount, forKey: "ui.primaryTabs")
+        d.set(showHeaderDate, forKey: "ui.headerDate")
         d.set(weatherCity, forKey: "weather.city")
         d.set(weatherLat, forKey: "weather.lat")
         d.set(weatherLon, forKey: "weather.lon")
         d.set(aiNumCtx, forKey: "ai.numCtx")
         d.set(aiTemperature, forKey: "ai.temperature")
+        d.set(quickPrompts, forKey: "ai.quickPrompts")
+        d.set(showQuickPrompts, forKey: "ai.quickChips")
         d.set(hotKeyEnabled, forKey: "hotkey.enabled")
         d.set(hotKeyPreset, forKey: "hotkey.preset")
         d.set(hideOnFullScreen, forKey: "dnd.fullscreen")
+        d.set(peekOnFullScreen, forKey: "peek.shift")
         d.set(dndScheduleEnabled, forKey: "dnd.schedule")
         d.set(dndStartHour, forKey: "dnd.start")
         d.set(dndEndHour, forKey: "dnd.end")
@@ -1088,6 +1783,9 @@ final class IslandModel: ObservableObject {
         d.set(collapseDelay, forKey: "tune.collapseDelay")
         d.set(clipboardMaxCount, forKey: "tune.clipMax")
         d.set(clipboardDedup, forKey: "tune.clipDedup")
+        d.set(todoVisibleCount, forKey: "ui.todoVisible")
+        d.set(noteVisibleCount, forKey: "ui.noteVisible")
+        d.set(fileVisibleCount, forKey: "ui.fileVisible")
         d.set(pomodoroDefaultMinutes, forKey: "tune.pomoDefault")
         d.set(pomodoroBreakMinutes, forKey: "tune.pomoBreak")
         d.set(timerSoundEnabled, forKey: "tune.timerSound")
@@ -1109,9 +1807,31 @@ final class IslandModel: ObservableObject {
         saveSettings()
     }
 
+    /// 页签在顶部的固定优先次序：主页与本地 AI 是主入口，其余小功能收进主页宫格
+    static let headerPriority: [IslandPanel] = [
+        .home, .chat, .files, .music, .todo, .notes, .timer, .clipboard, .launcher
+    ]
+
     var visiblePanels: [IslandPanel] {
-        let list = IslandPanel.allCases.filter { !hiddenTabs.contains($0.rawValue) }
+        let list = IslandModel.headerPriority.filter { !hiddenTabs.contains($0.rawValue) }
         return list.isEmpty ? IslandPanel.allCases : list
+    }
+
+    /// 常驻在第一行的主标签：按顺序取前 N 个；当前面板若不在其中，替换末位，保证它始终可见可点
+    var primaryPanels: [IslandPanel] {
+        let all = visiblePanels
+        let n = max(1, min(primaryTabCount, min(6, all.count)))
+        var head = Array(all.prefix(n))
+        if !head.contains(panel), let idx = all.firstIndex(of: panel) {
+            if head.count == n { head[n - 1] = all[idx] } else { head.append(all[idx]) }
+        }
+        return head
+    }
+
+    /// 收进「更多」菜单的其余页签
+    var overflowPanels: [IslandPanel] {
+        let head = Set(primaryPanels.map { $0.id })
+        return visiblePanels.filter { !head.contains($0.id) }
     }
 
     // MARK: - 开机自启 / 快捷键

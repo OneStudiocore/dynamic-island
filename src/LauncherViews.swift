@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 // MARK: - 应用启动台
 
@@ -32,7 +33,7 @@ struct LauncherPanel: View {
                     .buttonStyle(.plain)
                 }
 
-                Text("\(model.filteredApps.count)")
+                Text("\(model.filteredApps.count) 个")
                     .font(.system(size: 8.5 * s, weight: .medium))
                     .foregroundColor(.white.opacity(0.3))
             }
@@ -114,7 +115,11 @@ struct FilesPanel: View {
 
     var body: some View {
         VStack(spacing: 8 * s) {
-            dropZone
+            // 两个区域：左文件、右隔空投送
+            HStack(spacing: 6 * s) {
+                dropZone
+                airDropZone
+            }
 
             if model.stashedFiles.isEmpty {
                 Spacer(minLength: 0)
@@ -135,7 +140,7 @@ struct FilesPanel: View {
                         .foregroundColor(.white.opacity(0.85))
                         .padding(.horizontal, 8 * s)
                         .padding(.vertical, 4 * s)
-                        .background(Capsule().fill(Color(red: 0.09, green: 0.10, blue: 0.12)))
+                        .background(Capsule().fill(Color.white.opacity(0.06)))
                 }
                 .buttonStyle(.plain)
 
@@ -148,7 +153,7 @@ struct FilesPanel: View {
                             .foregroundColor(.white.opacity(0.8))
                             .padding(.horizontal, 8 * s)
                             .padding(.vertical, 4 * s)
-                            .background(Capsule().fill(Color(red: 0.09, green: 0.10, blue: 0.12)))
+                            .background(Capsule().fill(Color.white.opacity(0.06)))
                     }
                     .buttonStyle(.plain)
                 }
@@ -157,16 +162,16 @@ struct FilesPanel: View {
     }
 
     private var dropZone: some View {
-        VStack(spacing: 3 * s) {
+        VStack(spacing: 2 * s) {
             Image(systemName: model.dropTargeted ? "tray.and.arrow.down.fill" : "tray.and.arrow.down")
-                .font(.system(size: 15 * s, weight: .medium))
-                .foregroundColor(.white.opacity(model.dropTargeted ? 0.95 : 0.45))
-            Text(model.dropTargeted ? "松手就放进灵动岛" : "把文件拖到灵动岛上，就会放进这里")
-                .font(.system(size: 9.5 * s, weight: .medium))
-                .foregroundColor(.white.opacity(model.dropTargeted ? 0.9 : 0.5))
-            Text("也可以点一下选文件")
-                .font(.system(size: 8 * s))
-                .foregroundColor(.white.opacity(0.28))
+                .font(.system(size: 13 * s, weight: .medium))
+                .foregroundColor(.white.opacity(model.dropTargeted ? 0.95 : 0.5))
+            Text("文件")
+                .font(.system(size: 9.5 * s, weight: .semibold))
+                .foregroundColor(.white.opacity(0.85))
+            Text("拖入或点选")
+                .font(.system(size: 7.5 * s))
+                .foregroundColor(.white.opacity(0.3))
         }
         .frame(maxWidth: .infinity)
         .frame(height: 54 * s)
@@ -181,6 +186,38 @@ struct FilesPanel: View {
         )
         .contentShape(RoundedRectangle(cornerRadius: 12 * s, style: .continuous))
         .onTapGesture { pickFiles() }
+    }
+
+    // 隔空投送区：浅蓝背景的可放入框，文件拖入即弹 AirDrop 选人
+    private var airDropZone: some View {
+        VStack(spacing: 2 * s) {
+            Image(systemName: "rader")
+                .font(.system(size: 13 * s, weight: .semibold))
+                .foregroundColor(Color(red: 0.05, green: 0.22, blue: 0.45))
+            Text("隔空投送")
+                .font(.system(size: 9.5 * s, weight: .semibold))
+                .foregroundColor(Color(red: 0.05, green: 0.22, blue: 0.45))
+            Text("把文件拖到这里")
+                .font(.system(size: 7.5 * s))
+                .foregroundColor(Color(red: 0.05, green: 0.22, blue: 0.45).opacity(0.7))
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 54 * s)
+        .background(
+            RoundedRectangle(cornerRadius: 12 * s, style: .continuous)
+                .fill(Color(red: model.airDropTargeted ? 0.72 : 0.62,
+                            green: model.airDropTargeted ? 0.88 : 0.82,
+                            blue: 1.0))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12 * s, style: .continuous)
+                .strokeBorder(Color(red: 0.2, green: 0.5, blue: 0.85).opacity(model.airDropTargeted ? 0.8 : 0.35),
+                              lineWidth: 1)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 12 * s, style: .continuous))
+        .onDrop(of: [.fileURL],
+                delegate: AirDropDropDelegate(model: model))
+        .help("把文件拖进来，立刻选择隔空投送对象")
     }
 
     private func fileRow(_ file: StashedFile) -> some View {
@@ -243,5 +280,61 @@ struct FilesPanel: View {
         if panel.runModal() == .OK {
             model.stash(urls: panel.urls)
         }
+    }
+}
+
+/// 隔空投送框的拖放目标：拿到文件后立刻弹 AirDrop 选人
+struct AirDropDropDelegate: DropDelegate {
+    let model: IslandModel
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: [.fileURL])
+    }
+
+    func dropEntered(info: DropInfo) {
+        guard validateDrop(info: info) else { return }
+        model.airDropTargeted = true
+    }
+
+    func dropExited(info: DropInfo) {
+        model.airDropTargeted = false
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        model.airDropTargeted = false
+        let providers = info.itemProviders(for: [.fileURL])
+        guard !providers.isEmpty else { return false }
+
+        // 不能在主线程等待 loadItem：其回调可能就派发到主线程，会和 group.wait 互相死锁。
+        // 这里全程异步，全部加载完再回主线程弹 AirDrop。
+        let lock = NSLock()
+        var urls: [URL] = []
+        var completed = 0
+        let expected = providers.count
+
+        for provider in providers {
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { object, _ in
+                if let url = object as? URL {
+                    lock.lock(); urls.append(url); lock.unlock()
+                } else if let data = object as? Data,
+                          let url = URL(dataRepresentation: data, relativeTo: nil) {
+                    lock.lock(); urls.append(url); lock.unlock()
+                }
+
+                lock.lock()
+                completed += 1
+                let allDone = completed == expected
+                let snapshot = urls
+                lock.unlock()
+
+                if allDone {
+                    DispatchQueue.main.async {
+                        guard !snapshot.isEmpty else { return }
+                        model.airDrop(urls: snapshot)
+                    }
+                }
+            }
+        }
+        return true
     }
 }

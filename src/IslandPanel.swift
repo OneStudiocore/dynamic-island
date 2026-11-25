@@ -30,10 +30,16 @@ final class IslandWindow: NSPanel {
 /// 只让「岛」本身接收鼠标事件，窗口透明区域全部穿透到桌面/菜单栏
 final class IslandHostingView<Content: View>: NSHostingView<Content> {
     var hitRectProvider: (() -> CGRect)?
+    /// 锁头命中框（浮在面板外），让框外的锁头也能点中
+    var lockRectProvider: (() -> CGRect)?
+    /// 悬停判定（含迟滞边距），未设置时回退到 hitRect 包含判断
+    var hoverInsideProvider: ((NSPoint) -> Bool)?
     var hoverHandler: ((Bool) -> Void)?
     var acceptsDropProvider: (() -> Bool)?
     var dropHandler: (([URL]) -> Void)?
     var dropStateHandler: ((Bool) -> Void)?
+    /// 有效文件拖入岛时回调一次（用于自动切到文件栏）
+    var dropEnterHandler: (() -> Void)?
 
     private var trackingAreaRef: NSTrackingArea?
     private var inside = false
@@ -54,8 +60,12 @@ final class IslandHostingView<Content: View>: NSHostingView<Content> {
     override func mouseExited(with event: NSEvent) { setInside(false) }
 
     private func evaluate(_ event: NSEvent) {
-        guard let rect = hitRectProvider?(), rect.width > 0 else { setInside(false); return }
         let p = convert(event.locationInWindow, from: nil)
+        if let chk = hoverInsideProvider {
+            setInside(chk(p))
+            return
+        }
+        guard let rect = hitRectProvider?(), rect.width > 0 else { setInside(false); return }
         setInside(rect.contains(p))
     }
 
@@ -85,6 +95,7 @@ final class IslandHostingView<Content: View>: NSHostingView<Content> {
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         guard canAccept(sender) else { return [] }
         dropStateHandler?(true)
+        dropEnterHandler?()
         return .copy
     }
 
@@ -109,8 +120,12 @@ final class IslandHostingView<Content: View>: NSHostingView<Content> {
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        guard let rect = hitRectProvider?(), rect.width > 0 else { return nil }
         let p = convert(point, from: superview)
+        // 锁头浮在面板外，单独放行其命中
+        if let lock = lockRectProvider?(), lock.width > 0, lock.contains(p) {
+            return super.hitTest(point)
+        }
+        guard let rect = hitRectProvider?(), rect.width > 0 else { return nil }
         guard rect.contains(p) else { return nil }
         return super.hitTest(point)
     }

@@ -13,30 +13,36 @@ struct IslandRootView: View {
             ? .easeOut(duration: 0.18)
             : .spring(response: 0.66 * model.animationSpeed, dampingFraction: 0.84, blendDuration: 0.30)
 
-        return ZStack(alignment: .top) {
+        let base = ZStack(alignment: .top) {
             Color.clear
             island(geo: geo, shape: shape)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+
+        // 离屏逐帧录制：几何由外部逐帧给定，关闭隐式动画，避免逐帧之间再被弹簧插值
+        if model.snapshotMode { return AnyView(base) }
         // 收起 ↔ 展开：整块尺寸 / 圆角 / 顶部距离都走同一条弹性动画，有过程不跳变。
-        .animation(rootAnim, value: geo)
-        .animation(rootAnim, value: model.panel)
+        return AnyView(
+            base
+                .animation(rootAnim, value: geo)
+                .animation(rootAnim, value: model.panel)
+        )
     }
 
     // MARK: - 液态玻璃岛体
 
     private func island(geo: IslandGeometry, shape: IslandShape) -> some View {
         ZStack {
+            glassLayer(shape: shape, geo: geo)
             bodyFill(geo: geo, shape: shape)
             contentLayer(geo: geo)
         }
         .frame(width: geo.size.width, height: geo.size.height)
-        .background(glassBackdrop(shape: shape))
         .clipShape(shape)
         .overlay(rim(shape: shape, geo: geo))
         .overlay(sheen(shape: shape))
         // 收起态阴影更轻更贴，避免小胶囊挂着一团黑影；展开态保留纵深；强度可手动调节
-        .shadow(color: .black.opacity(model.morphing ? 0.0 : (model.expanded ? 0.42 : 0.26) * model.shadowStrength),
+        .shadow(color: .black.opacity((model.expanded ? 0.42 : 0.26) * model.shadowStrength),
                 radius: (model.expanded ? 18 : 12) * s,
                 x: 0,
                 y: (model.expanded ? 9 : 5) * s)
@@ -50,20 +56,42 @@ struct IslandRootView: View {
         .accessibilityLabel("灵动岛")
         .accessibilityHint("点一下展开，再点收起")
         .accessibilityAddTraits(.isButton)
+        .overlay(alignment: .bottomTrailing) {
+            // 锁头浮在面板右下角外侧（在 clipShape 之外，不会被圆角裁切）
+            if model.expanded && !model.snapshotHideLock {
+                lockButton
+                    .offset(x: model.lockSize * 0.35, y: model.lockSize * 0.15)
+            }
+        }
         .offset(y: geo.topInset)
     }
 
-    // MARK: - 形变可见度
+    // MARK: - 右下角锁头（图标 + 毛玻璃圆形底框）
 
-    /// 岛体宽度低于 210pt 时内容全隐藏、高于 330pt 时全显示，中间线性升幂淡入。
-    /// 形变途中（胶囊 ↔ 面板）内容不会再被圆角裁成碎片。
-    private func contentOpacity(currentWidth: CGFloat) -> Double {
-        guard model.expanded else { return 0.72 }
-        let low = 210 * s
-        let high = 330 * s
-        let ramp = min(1.0, max(0.0, Double((currentWidth - low) / (high - low))))
-        return pow(ramp, 1.4)
+    private var lockButton: some View {
+        Button { model.toggleLock() } label: {
+            Image(systemName: model.locked ? "lock.fill" : "lock.open")
+                .font(.system(size: 10 * s, weight: .semibold))
+                .foregroundColor(model.locked
+                                 ? Color(red: 0.45, green: 0.75, blue: 1.0)
+                                 : .white.opacity(0.9))
+                .frame(width: model.lockSize, height: model.lockSize)
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay(
+                    Circle().strokeBorder(
+                        model.locked
+                        ? Color(red: 0.45, green: 0.75, blue: 1.0)
+                        : Color.white.opacity(0.55),
+                        lineWidth: 1)
+                )
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help(model.locked ? "已锁定：点一下解锁" : "点一下锁定，灵动岛不会消失")
+        .accessibilityLabel(model.locked ? "解锁" : "锁定")
     }
+
+    /// 上半死黑、下半化开成液态玻璃；AI 面板更高，黑色区域也相应下移
 
     /// ② 本体：展开时上半死黑、下半渐变到真透明；收起时纯黑
     @ViewBuilder
@@ -78,13 +106,25 @@ struct IslandRootView: View {
     }
 
     /// ③ 内容层
+    /// 内容透明度跟随「当前实际宽度 / 展开稳定宽度」：岛体窄时内容淡出，长开后淡入。
+    /// 这样形变途中不会出现"胶囊还很小、里面却塞着 404 宽的整行图标被裁成碎片"的破相。
     private func contentLayer(geo: IslandGeometry) -> some View {
-        GeometryReader { proxy in
-            content(geo: geo)
-                .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
-                .opacity(contentOpacity(currentWidth: proxy.size.width))
-        }
-        .animation(.easeInOut(duration: 0.26), value: model.expanded)
+        // 内容按「目标几何」一次性布局好，形变期间不再参与任何布局计算。
+        // 动画交给外层的 frame + clipShape：那是 GPU 合成侧的活，
+        // 内容树只是被裁剪出来的一块，不用每帧重排、也不用按宽度算透明度。
+        content(geo: geo)
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
+            .transaction { $0.animation = nil }
+            .allowsHitTesting(model.expanded)
+            .animation(.easeInOut(duration: 0.26), value: model.expanded)
+    }
+
+    private func contentOpacity(currentWidth: CGFloat) -> Double {
+        guard model.expanded else { return 0.72 }
+        let low = 210 * s
+        let high = 330 * s
+        let ramp = min(1.0, max(0.0, Double((currentWidth - low) / (high - low))))
+        return pow(ramp, 1.4)
     }
 
     /// ① 官方 Liquid Glass，只保留在「边缘带」：中间整块挖空 → 内部永远像素级透明
@@ -92,6 +132,20 @@ struct IslandRootView: View {
     private func glassBackdrop(shape: IslandShape) -> some View {
         shape.fill(Color.clear)
             .glassEffect(glass, in: shape)
+    }
+
+    /// 液态玻璃独立成层，并且**不参与逐帧形变**。
+    ///
+    /// 掉帧的根因不是玻璃本身，而是它之前挂在 `.background` 上：
+    /// 岛体 frame / 圆角每一帧都在插值，玻璃就得跟着每一帧按新轮廓重采样背景，
+    /// 面积越大越贵。这里把玻璃固定为目标几何的尺寸、禁用动画，
+    /// 外面的 `clipShape` 照常弹性形变 —— 可见区域仍是被裁剪出来的那块玻璃，
+    /// 材质、反光、边缘折射全都在，但动画期间不用反复重算采样区。
+    private func glassLayer(shape: IslandShape, geo: IslandGeometry) -> some View {
+        glassBackdrop(shape: shape)
+            .frame(width: geo.size.width, height: geo.size.height)
+            .transaction { $0.animation = nil }
+            .allowsHitTesting(false)
     }
 
     private var blackStops: [Gradient.Stop] {
@@ -132,14 +186,14 @@ struct IslandRootView: View {
         let tint = model.glassStrength * (model.expanded ? 0.25 : 1.0)
         return base
             .tint(Color(red: 0.03, green: 0.04, blue: 0.06).opacity(tint))
-            .interactive(true)
+            // 高光跟随鼠标保留，只在形变那零点几秒暂时关闭：
+            // 这时轮廓在快速变化，交互高光只会逼它多做无用功。
+            .interactive(!model.morphing)
     }
 
     /// 玻璃边缘的镜面反光（液态玻璃最典型的特征）
     private func rim(shape: IslandShape, geo: IslandGeometry) -> some View {
-        // 内容已淡出时边缘反光一并压暗：黑色岛体在纯黑背景上不留一圈空描边
-        let dim = model.expanded ? (0.15 + 0.85 * contentOpacity(currentWidth: geo.size.width)) : 1.0
-        return shape.stroke(
+        shape.stroke(
             LinearGradient(
                 stops: [
                     .init(color: .white.opacity(0.30 * model.rimBrightness), location: 0.0),
@@ -152,7 +206,6 @@ struct IslandRootView: View {
             ),
             lineWidth: 1
         )
-        .opacity(dim)
         .blendMode(.plusLighter)
         .allowsHitTesting(false)
     }
@@ -180,7 +233,9 @@ struct IslandRootView: View {
 
     @ViewBuilder
     private func content(geo: IslandGeometry) -> some View {
-        if let transient = model.transient {
+        if model.cameraMirrorOpen {
+            CameraMirrorView(model: model)
+        } else if let transient = model.transient {
             switch transient {
             case .volume:
                 VolumeHUD(model: model)

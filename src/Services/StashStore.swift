@@ -18,12 +18,24 @@ struct StashedFile: Identifiable, Equatable, Codable {
     var exists: Bool { FileManager.default.fileExists(atPath: path) }
 }
 
+// MARK: - 待办事项
+
+struct TodoItem: Identifiable, Equatable, Codable {
+    var id = UUID()
+    var title: String
+    var done: Bool = false
+    var createdAt: Date
+}
+
 @MainActor
 final class StashStore {
     static let shared = StashStore()
 
     private(set) var notes: [QuickNote] = []
     private(set) var files: [StashedFile] = []
+    private(set) var todos: [TodoItem] = []
+    /// 速记草稿（单段常驻文本，自动保存）
+    private(set) var scratchpad: String = ""
 
     private let dir: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory,
@@ -33,6 +45,8 @@ final class StashStore {
 
     private var notesURL: URL { dir.appendingPathComponent("notes.json") }
     private var filesURL: URL { dir.appendingPathComponent("stash.json") }
+    private var todosURL: URL { dir.appendingPathComponent("todos.json") }
+    private var scratchpadURL: URL { dir.appendingPathComponent("scratchpad.txt") }
 
     init() { load() }
 
@@ -52,6 +66,13 @@ final class StashStore {
            let list = try? decoder.decode([StashedFile].self, from: data) {
             files = list.filter { $0.exists }
         }
+        if let data = try? Data(contentsOf: todosURL),
+           let list = try? decoder.decode([TodoItem].self, from: data) {
+            todos = list
+        }
+        if let text = try? String(contentsOf: scratchpadURL, encoding: .utf8) {
+            scratchpad = text
+        }
     }
 
     private func persist() {
@@ -60,6 +81,7 @@ final class StashStore {
         encoder.dateEncodingStrategy = .iso8601
         if let data = try? encoder.encode(notes) { try? data.write(to: notesURL) }
         if let data = try? encoder.encode(files) { try? data.write(to: filesURL) }
+        if let data = try? encoder.encode(todos) { try? data.write(to: todosURL) }
     }
 
     // MARK: 笔记
@@ -72,11 +94,6 @@ final class StashStore {
         if notes.count > 300 { notes.removeLast(notes.count - 300) }
         persist()
         return true
-    }
-
-    func removeNote(_ note: QuickNote) {
-        notes.removeAll { $0.id == note.id }
-        persist()
     }
 
     func clearNotes() {
@@ -111,4 +128,39 @@ final class StashStore {
     }
 
     var directory: URL { dir }
+
+    // MARK: 待办事项
+
+    @discardableResult
+    func addTodo(_ title: String) -> Bool {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        todos.insert(TodoItem(title: trimmed, createdAt: Date()), at: 0)
+        persist()
+        return true
+    }
+
+    func toggleTodo(_ item: TodoItem) {
+        guard let i = todos.firstIndex(where: { $0.id == item.id }) else { return }
+        todos[i].done.toggle()
+        persist()
+    }
+
+    func removeTodo(_ item: TodoItem) {
+        todos.removeAll { $0.id == item.id }
+        persist()
+    }
+
+    func clearDoneTodos() {
+        todos.removeAll { $0.done }
+        persist()
+    }
+
+    // MARK: 速记草稿
+
+    func saveScratchpad(_ text: String) {
+        scratchpad = text
+        ensureDir()
+        try? text.data(using: .utf8)?.write(to: scratchpadURL)
+    }
 }

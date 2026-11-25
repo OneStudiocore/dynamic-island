@@ -44,8 +44,6 @@ final class WeatherService {
     private var lastFetch: Date?
     private var cached: WeatherNow?
 
-    func cachedWeather() -> WeatherNow? { cached }
-
     func refresh(latitude: Double, longitude: Double, city: String,
                  completion: @escaping (WeatherNow?) -> Void) {
         if let last = lastFetch, Date().timeIntervalSince(last) < 600, let c = cached {

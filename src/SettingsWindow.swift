@@ -81,7 +81,7 @@ final class SettingsWindowController {
 // MARK: - 设置界面
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case general, tuning, appearance, tabs, widgets, ai, cloudAI, storage, about
+    case general, tuning, appearance, tabs, toolbar, widgets, pet, ai, cloudAI, storage, about
 
     var id: String { rawValue }
 
@@ -91,7 +91,9 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .tuning: return "精细调节"
         case .appearance: return "外观与尺寸"
         case .tabs: return "页签"
+        case .toolbar: return "顶部工具栏"
         case .widgets: return "主页组件"
+        case .pet: return "桌宠"
         case .ai: return "本地 AI"
         case .cloudAI: return "云端 AI"
         case .storage: return "笔记与暂存"
@@ -105,7 +107,9 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .tuning: return "slider.horizontal.3"
         case .appearance: return "rectangle.on.rectangle"
         case .tabs: return "square.grid.2x2"
+        case .toolbar: return "menubar.rectangle"
         case .widgets: return "square.stack.3d.up"
+        case .pet: return "pawprint.fill"
         case .ai: return "sparkles"
         case .cloudAI: return "cloud"
         case .storage: return "tray.full"
@@ -116,14 +120,30 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 
 @MainActor
 final class SettingsState: ObservableObject {
-    @Published var section: SettingsSection = .appearance
+    static let shared = SettingsState()
+    private static let key = "settings.section"
+
+    /// 记住上次停留的设置页，下次打开原地继续（以前每次都跳回外观页）
+    @Published var section: SettingsSection = SettingsState.loaded {
+        didSet {
+            guard section != oldValue else { return }
+            UserDefaults.standard.set(section.rawValue, forKey: SettingsState.key)
+        }
+    }
+
+    private static var loaded: SettingsSection {
+        guard let raw = UserDefaults.standard.string(forKey: key),
+              let v = SettingsSection(rawValue: raw) else { return .appearance }
+        return v
+    }
 }
 
 struct SettingsView: View {
     @ObservedObject var model: IslandModel
     var onClose: () -> Void
 
-    @ObservedObject private var state = SettingsState()
+    @ObservedObject private var state = SettingsState.shared
+    @ObservedObject private var hover = HoverState.shared
 
     private var section: SettingsSection {
         get { state.section }
@@ -133,17 +153,21 @@ struct SettingsView: View {
     private let sidebarWidth: CGFloat = 168
 
     var body: some View {
-        HStack(spacing: 0) {
-            sidebar
-            Divider().overlay(Color.white.opacity(0.08))
-            ScrollView(.vertical, showsIndicators: false) {
-                content
-                    .padding(22)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+        GeometryReader { g in
+            HStack(spacing: 0) {
+                sidebar
+                Divider().overlay(Color.white.opacity(0.08))
+                ScrollView(.vertical, showsIndicators: false) {
+                    content
+                        .frame(width: max(0, g.size.width - sidebarWidth - 45), alignment: .topLeading)
+                        .padding(22)
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .environment(\.hoverBox, g.frame(in: .global))
+            .background(Tokens.S.sunken)
+            .preferredColorScheme(.dark)
         }
-        .background(Color(red: 0.08, green: 0.085, blue: 0.1))
-        .preferredColorScheme(.dark)
     }
 
     private var sidebar: some View {
@@ -160,27 +184,41 @@ struct SettingsView: View {
             .padding(.top, 26)
             .padding(.bottom, 16)
 
-            ForEach(SettingsSection.allCases) { s in
-                Button { state.section = s } label: {
+            ForEach(SettingsSection.allCases) { sec in
+                let key = "sec-" + sec.rawValue
+                let hot = hover.key == key
+                let on = state.section == sec
+                Button { state.section = sec } label: {
                     HStack(spacing: 9) {
-                        Image(systemName: s.symbol)
+                        Image(systemName: sec.symbol)
                             .font(.system(size: 11, weight: .medium))
-                            .frame(width: 16)
-                            .foregroundColor(.white.opacity(state.section == s ? 0.9 : 0.4))
-                        Text(s.title)
+                            .frame(width: 16, height: 16)
+                            .foregroundColor(.white.opacity(on ? 0.9 : (hot ? 0.85 : 0.4)))
+                            .scaleEffect(hot ? 1.06 : 1)
+                        Text(sec.title)
                             .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(.white.opacity(state.section == s ? 0.92 : 0.55))
+                            .foregroundColor(.white.opacity(on ? 0.92 : (hot ? 0.78 : 0.55)))
                         Spacer()
+                        if hot && !on {
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundColor(.white.opacity(0.5))
+                                .transition(.opacity)
+                        }
                     }
                     .padding(.horizontal, 10)
-                    .padding(.vertical, 7)
+                    .frame(height: 28)
                     .background(
-                        RoundedRectangle(cornerRadius: 7)
-                            .fill(Color.white.opacity(state.section == s ? 0.09 : 0))
+                        RoundedRectangle(cornerRadius: Tokens.R.chip)
+                            .fill(Color.white.opacity(on ? 0.09 : (hot ? 0.055 : 0)))
                     )
+                    .offset(x: hot && !on ? 2 : 0)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .focusEffectDisabled()
+                .hoverBoost(key, scale: 1, lift: 0, glow: 0)
+                .animation(.spring(response: 0.24, dampingFraction: 0.66), value: hot)
                 .padding(.horizontal, 10)
             }
 
@@ -190,8 +228,10 @@ struct SettingsView: View {
                 Text("关闭")
                     .font(.system(size: 11))
                     .foregroundColor(.white.opacity(0.4))
+                    .padding(.horizontal, 4)
             }
             .buttonStyle(.plain)
+            .hoverBoost("sec-close", scale: 1.08, lift: 0, glow: 0.16)
             .padding(18)
         }
         .frame(width: sidebarWidth)
@@ -205,7 +245,9 @@ struct SettingsView: View {
         case .tuning: TuningPage(model: model)
         case .appearance: AppearancePage(model: model)
         case .tabs: TabsPage(model: model)
+        case .toolbar: ToolbarPage(model: model)
         case .widgets: WidgetsPage(model: model)
+        case .pet: PetPage()
         case .ai: AIPage(model: model)
         case .cloudAI: CloudAIPage(model: model)
         case .storage: StoragePage(model: model)
@@ -557,6 +599,12 @@ struct GeneralPage: View {
                     model.hideOnFullScreen = on
                     model.saveSettings()
                 }
+                ToggleRow(label: "全屏时快速双击 Shift 呼出",
+                          hint: "全屏里岛已隐藏，连按两下 Shift 也能把它叫出来；首次使用需在系统设置里允许「输入监控」",
+                          isOn: model.peekOnFullScreen) { on in
+                    model.peekOnFullScreen = on
+                    model.saveSettings()
+                }
                 ToggleRow(label: "免打扰时段",
                           hint: "时段内不自动弹出音量、剪贴板、计时提示",
                           isOn: model.dndScheduleEnabled) { on in
@@ -594,6 +642,43 @@ struct GeneralPage: View {
                           value: model.hudDuration, range: 0.8...4.0, format: "%.1f 秒") { v in
                     model.hudDuration = v; model.saveSettings() }
             }
+
+            SettingsCard(title: "健康提醒") {
+                ToggleRow(label: "喝水提醒", hint: "每隔一段时间提醒你喝水",
+                          isOn: model.waterReminderOn) { on in
+                    model.setWaterReminder(on: on) }
+                SliderRow(label: "喝水间隔", hint: "两次喝水提醒之间的时间",
+                          value: model.waterReminderInterval, range: 30...180,
+                          format: "%.0f 分钟") { v in
+                    model.setWaterInterval(v) }
+                .opacity(model.waterReminderOn ? 1 : 0.4)
+                ToggleRow(label: "久坐提醒", hint: "长时间没活动时提醒你起身",
+                          isOn: model.sedentaryReminderOn) { on in
+                    model.setSedentaryReminder(on: on) }
+                SliderRow(label: "久坐间隔", hint: "多久没活动就提醒",
+                          value: model.sedentaryReminderInterval, range: 25...120,
+                          format: "%.0f 分钟") { v in
+                    model.setSedentaryInterval(v) }
+                .opacity(model.sedentaryReminderOn ? 1 : 0.4)
+            }
+
+            SettingsCard(title: "顶部形态") {
+                ToggleRow(label: "改为刘海",
+                          hint: "打开：按刘海适配，内容向下多让一行半；关闭：按灵动岛适配，让一行",
+                          isOn: model.forceNotchMode) { on in
+                    model.setForceNotch(on) }
+                Text(currentFormText)
+                    .font(.system(size: 10))
+                    .foregroundColor(.white.opacity(0.35))
+            }
+        }
+    }
+
+    private var currentFormText: String {
+        switch model.effectiveDeviceKind {
+        case .standard: return "当前生效：普通 Mac（无顶部遮挡）"
+        case .notch: return "当前生效：刘海屏，避让 \(String(format: "%.0f", model.notchClearance))px"
+        case .dynamicIsland: return "当前生效：灵动岛，避让 \(String(format: "%.0f", model.notchClearance))px"
         }
     }
 
@@ -739,28 +824,31 @@ struct AppearancePage: View {
                     .foregroundColor(.white.opacity(0.26))
             }
 
-            ZStack {
-                if let img = previewWallpaper {
-                    Image(nsImage: img)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                } else {
-                    LinearGradient(colors: [Color(white: 0.24), Color(white: 0.1)],
-                                   startPoint: .top, endPoint: .bottom)
-                }
-                Color.black.opacity(0.16)
+            GeometryReader { geo in
+                let k = max(0.04, (geo.size.width - 40) / CGFloat(model.panelWidth + 156))
+                ZStack {
+                    if let img = previewWallpaper {
+                        Image(nsImage: img)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                    } else {
+                        LinearGradient(colors: [Color(white: 0.24), Color(white: 0.1)],
+                                       startPoint: .top, endPoint: .bottom)
+                    }
+                    Color.black.opacity(0.16)
 
-                VStack(spacing: 8) {
-                    // 收起态
-                    Capsule()
-                        .fill(Color.black)
-                        .frame(width: CGFloat(model.compactWidth) * CGFloat(model.compactRatio) * model.screenScale * mockScale,
-                               height: CGFloat(model.compactHeight) * CGFloat(model.compactRatio) * model.screenScale * mockScale)
-                        .shadow(color: .black.opacity(0.45), radius: 6, y: 3)
+                    VStack(spacing: 8) {
+                        // 收起态
+                        Capsule()
+                            .fill(Color.black)
+                            .frame(width: CGFloat(model.compactWidth) * CGFloat(model.compactRatio) * k,
+                                   height: CGFloat(model.compactHeight) * CGFloat(model.compactRatio) * k)
+                            .shadow(color: .black.opacity(0.45), radius: 6, y: 3)
 
-                    expandedMock
+                        expandedMock(k)
+                    }
+                    .padding(.top, 14)
                 }
-                .padding(.top, 14)
             }
             .frame(height: 232)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -776,8 +864,7 @@ struct AppearancePage: View {
     }
 
     /// 启动台比例的面板缩略（宽高圆角都跟着滑杆走）
-    private var expandedMock: some View {
-        let k = model.screenScale * mockScale
+    private func expandedMock(_ k: CGFloat) -> some View {
         let w = CGFloat(model.panelWidth + 156) * CGFloat(model.panelScale) * k
         let h: CGFloat = 452 * CGFloat(model.panelScale) * k
         let r = CGFloat(model.cornerRadius) * CGFloat(model.panelScale) * k
@@ -825,23 +912,29 @@ struct AppearancePage: View {
 
 struct TabsPage: View {
     @ObservedObject var model: IslandModel
+    @ObservedObject private var hover = HoverState.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             SettingsCard(title: "显示哪些页签") {
                 ForEach(IslandPanel.allCases) { p in
+                    let key = "tabs-" + p.rawValue
+                    let hot = hover.key == key
                     HStack(spacing: 9) {
                         Image(systemName: p.symbol)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(.white.opacity(0.5))
+                            .font(.system(size: (hot ? 12.5 : 11), weight: .medium))
+                            .foregroundColor(.white.opacity(hot ? 0.98 : 0.5))
                             .frame(width: 18)
+                            .scaleEffect(hot ? 1.12 : 1)
+                            .shadow(color: hot ? Color.white.opacity(0.45) : .clear,
+                                    radius: hot ? 6 : 0)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(p.title)
                                 .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(.white.opacity(0.85))
+                                .foregroundColor(.white.opacity(hot ? 1 : 0.85))
                             Text(p.tall ? "加高面板" : "标准面板")
                                 .font(.system(size: 9.5))
-                                .foregroundColor(.white.opacity(0.35))
+                                .foregroundColor(.white.opacity(hot ? 0.55 : 0.35))
                         }
                         Spacer()
                         Toggle("", isOn: Binding(
@@ -852,7 +945,92 @@ struct TabsPage: View {
                         .toggleStyle(.switch)
                         .controlSize(.small)
                     }
-                    .padding(.vertical, 3)
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 7)
+                    .background(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .fill(Color.white.opacity(hot ? 0.06 : 0))
+                    )
+                    .contentShape(Rectangle())
+                    .hoverBoost(key, scale: 1, lift: 0, glow: 0)
+                    .animation(.easeOut(duration: 0.18), value: hot)
+                }
+            }
+        }
+    }
+}
+
+struct ToolbarPage: View {
+    @ObservedObject var model: IslandModel
+
+    private let counts = [3, 4, 5, 6]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            SettingsCard(title: "第一行保留几个页签") {
+                Text("第一行是常用功能的页签，右边固定相机、设置与收起；更次要的功能都在主页小组件里。")
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.45))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 8) {
+                    ForEach(counts, id: \.self) { n in
+                        Button {
+                            model.primaryTabCount = n
+                            model.saveSettings()
+                        } label: {
+                            Text("\(n) 个")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(model.primaryTabCount == n
+                                                 ? .white : .white.opacity(0.5))
+                                .frame(width: 56, height: 28)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .fill(Color.white.opacity(model.primaryTabCount == n ? 0.16 : 0.06))
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .strokeBorder(Color.white.opacity(model.primaryTabCount == n ? 0.22 : 0.06),
+                                                      lineWidth: 0.7)
+                                )
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .hoverBoost("tabs-count-\(n)", scale: 1.05, lift: 0, glow: 0.14)
+                    }
+                    Spacer()
+                }
+
+                Text("当前可见 \(model.visiblePanels.count) 个页签，第一行固定显示 \(model.primaryPanels.count) 个。")
+                    .font(.system(size: 10))
+                    .foregroundColor(.white.opacity(0.35))
+            }
+
+            SettingsCard(title: "顶部元素") {
+                ToggleRow(label: "显示日期",
+                          hint: "右对齐的小字日期，关掉后第一行只剩图标",
+                          isOn: model.showHeaderDate) { v in
+                    model.showHeaderDate = v
+                    model.saveSettings()
+                }
+            }
+
+            SettingsCard(title: "右侧固定项") {
+                HStack(spacing: 10) {
+                    Image(systemName: "gearshape")
+                        .foregroundColor(.white.opacity(0.45))
+                    Text("齿轮菜单：摄像头镜子 / 设置 / 退出")
+                        .font(.system(size: 11))
+                        .foregroundColor(.white.opacity(0.55))
+                    Spacer()
+                }
+                HStack(spacing: 10) {
+                    Image(systemName: "xmark")
+                        .foregroundColor(.white.opacity(0.45))
+                    Text("收起灵动岛")
+                        .font(.system(size: 11))
+                        .foregroundColor(.white.opacity(0.55))
+                    Spacer()
                 }
             }
         }
@@ -862,12 +1040,41 @@ struct TabsPage: View {
 struct WidgetsPage: View {
     @ObservedObject var model: IslandModel
 
+    private func countRow(_ label: String, value: Int, set: @escaping (Int) -> Void) -> some View {
+        HStack(spacing: 10) {
+            Text(label)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundColor(.white.opacity(0.85))
+            Spacer()
+            Text("\(value) 条")
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(.white.opacity(0.55))
+                .frame(width: 40, alignment: .trailing)
+            Stepper("", value: Binding(get: { value }, set: {
+                set($0)
+                model.saveSettings()
+            }), in: 1...4)
+                .labelsHidden()
+                .controlSize(.small)
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             SettingsCard(title: "主页组件") {
                 Text("主页固定展示：天气、番茄钟、快速笔记、CPU/内存/磁盘、四个常用 App 入口。")
                     .font(.system(size: 11))
                     .foregroundColor(.white.opacity(0.45))
+            }
+
+            SettingsCard(title: "卡片里显示几条") {
+                Text("卡片高度是固定的，条数调多会挤，1–4 条之间比较稳。")
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.45))
+
+                countRow("待办", value: model.todoVisibleCount) { model.todoVisibleCount = $0 }
+                countRow("最近笔记", value: model.noteVisibleCount) { model.noteVisibleCount = $0 }
+                countRow("文件暂存", value: model.fileVisibleCount) { model.fileVisibleCount = $0 }
             }
 
             SettingsCard(title: "天气") {
@@ -961,6 +1168,44 @@ struct AIPage: View {
                           value: model.aiTemperature, range: 0.0...1.5, format: "%.2f") { v in
                     model.aiTemperature = v
                     model.saveSettings()
+                }
+            }
+
+            SettingsCard(title: "快捷指令") {
+                ToggleRow(label: "在空白对话里显示",
+                          hint: "对话为空时，AI 面板底部出现前三条指令，点一下直接发送",
+                          isOn: model.showQuickPrompts) { v in
+                    model.showQuickPrompts = v
+                    model.saveSettings()
+                }
+
+                Text("点击即发送；{clip} 会被替换成剪贴板正文（最多 1500 字）。")
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.white.opacity(0.4))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                ForEach(model.quickPrompts.indices, id: \.self) { i in
+                    TextField("指令", text: Binding(
+                        get: { i < model.quickPrompts.count ? model.quickPrompts[i] : "" },
+                        set: { if i < model.quickPrompts.count { model.quickPrompts[i] = $0 } }
+                    ))
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundColor(.white)
+                    .padding(6)
+                    .background(RoundedRectangle(cornerRadius: 7).fill(Color.white.opacity(0.07)))
+                }
+
+                HStack {
+                    Button("保存") { model.saveSettings() }
+                        .font(.system(size: 11))
+                    Button("恢复默认") {
+                        model.quickPrompts = IslandModel.defaultQuickPrompts
+                        model.saveSettings()
+                    }
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.6))
+                    Spacer()
                 }
             }
         }
@@ -1107,6 +1352,7 @@ private struct CloudProviderCard: View {
             HStack(spacing: 8) {
                 if let preset {
                     BrandLogoView(file: preset.logoFile, fallback: preset.brandIcon, size: 19)
+                        .hoverBoost("cloud-" + id.uuidString, scale: 1.28, lift: 0, glow: 0.3)
                 }
                 TextField("名称", text: bind(\.name))
                     .textFieldStyle(.plain)

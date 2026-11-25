@@ -15,15 +15,19 @@
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>1.2</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
     <key>LSMinimumSystemVersion</key>
     <string>26.0</string>
     <key>LSUIElement</key>
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSCameraUsageDescription</key>
+    <string>灵动岛需要使用摄像头，作为镜子实时预览画面。</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>灵动岛的 Siri 光带需要读取麦克风电平，让光带跟着声音起伏。</string>
     <key>NSHumanReadableCopyright</key>
     <string>© 2026 OneStudiocore 版权所有</string>
     <key>NSAppTransportSecurity</key>

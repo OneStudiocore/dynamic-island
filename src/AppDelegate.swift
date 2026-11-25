@@ -11,23 +11,103 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let hotKeys = HotKeyManager()
     private var cancellables = Set<AnyCancellable>()
     private var fullScreenTimer: Timer?
+    private let petWindows = PetWindowController()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let window = IslandWindow(contentRect: .zero)
         let host = IslandHostingView(rootView: IslandRootView(model: model))
         host.hitRectProvider = { [weak model] in model?.hitRect ?? .zero }
+        host.lockRectProvider = { [weak model] in model?.lockRect ?? .zero }
+        host.hoverInsideProvider = { [weak model] point in
+            model?.isHoverPointInside(point) ?? false
+        }
         host.hoverHandler = { [weak model] inside in model?.setHover(inside) }
-        host.acceptsDropProvider = { [weak model] in
-            guard let model else { return false }
-            return model.expanded && model.panel == .files
+        host.acceptsDropProvider = {
+            // 只要拖的是文件就接受；具体面板由 dropEnterHandler 自动切到文件栏
+            true
         }
         host.dropHandler = { [weak model] urls in model?.stash(urls: urls) }
         host.dropStateHandler = { [weak model] targeted in model?.dropTargeted = targeted }
+        host.dropEnterHandler = { [weak model] in model?.presentFilesForDrop() }
         host.registerForDraggedTypes([.fileURL])
         window.contentView = host
         islandWindow = window
         repositionIsland()
         window.orderFrontRegardless()
+        // 自检：带 ISLAND_TASKS_AUTO_RUN=1 启动就把第一条任务立即跑一次
+        if ProcessInfo.processInfo.environment["ISLAND_TASKS_AUTO_RUN"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self, let id = self.model.taskEngine.tasks.first?.id else { return }
+                self.model.taskEngine.runNow(id)
+            }
+        }
+        DemoRecorder.startIfNeeded(model: model, window: window)
+
+        // 开发/审图用：demo.preview 为 true 时直接展开到指定面板并锁定，方便截图核对
+        if UserDefaults.standard.bool(forKey: "demo.preview") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let self else { return }
+                let name = UserDefaults.standard.string(forKey: "demo.panel") ?? "home"
+                if let target = IslandPanel(rawValue: name) { self.model.panel = target }
+                withAnimation(IslandModel.spring) {
+                    self.model.locked = true
+                    self.model.pinned = true
+                    self.model.hovered = true
+                }
+                if let m = UserDefaults.standard.string(forKey: "demo.menu") {
+                    self.model.headerMenu = (m == "actions") ? .actions : .tabs
+                }
+            }
+        }
+        // 开发/审图用：demo.chatImage 指向本地图片时先挂到待发附件里，核对识图气泡
+        if let imgPath = UserDefaults.standard.string(forKey: "demo.chatImage"), !imgPath.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                if let url = ChatImage.dataURL(fromFile: URL(fileURLWithPath: imgPath)) {
+                    self?.model.appendPendingImage(url)
+                }
+            }
+        }
+        // 开发/审图用：demo.chatSeed 有值时自动发一条消息，用于核对追问与图片气泡
+        if let seed = UserDefaults.standard.string(forKey: "demo.chatSeed"), !seed.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                self?.model.runQuickPrompt(seed)
+            }
+        }
+
+        // 开发/审图用：demo.attachMenu 为 true 时自动展开附件菜单，核对样式
+        if UserDefaults.standard.bool(forKey: "demo.attachMenu") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+                self?.model.showAttachMenu = true
+            }
+        }
+        // 开发/审图用：demo.pickImage 为 true 时自动拉起选图面板，核对能否弹出
+        if UserDefaults.standard.bool(forKey: "demo.pickImage") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { [weak self] in
+                self?.model.pickImageFiles()
+            }
+        }
+
+        // 开发/审图用：demo.followClick 为 true 时，等追问出现后自动点第一条，验证"点一下就发出去"
+        if UserDefaults.standard.bool(forKey: "demo.followClick") {
+            var ticks = 0
+            Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] timer in
+                ticks += 1
+                guard let self else { timer.invalidate(); return }
+                if let first = self.model.followUps.first, !self.model.chatBusy {
+                    timer.invalidate()
+                    self.model.sendFollowUp(first)
+                } else if ticks > 90 {
+                    timer.invalidate()
+                }
+            }
+        }
+
+        // 开发/审图用：demo.settings 为 true 时自动打开设置窗口（可指定板块）
+        if UserDefaults.standard.bool(forKey: "demo.settings") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+                self?.openSettings()
+            }
+        }
 
         // 分辨率/显示器数量变化时系统会发这个通知；重算位置，避免窗口停在旧坐标跑到屏幕外
         NotificationCenter.default.addObserver(
@@ -68,12 +148,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window?.makeKeyAndOrderFront(nil)
         }
         model.start()
+        petWindows.attach(model: model)
         model.syncLaunchAtLogin()
         model.refreshLlamaModels()
         installStatusItem()
         setupHotKeys()
         startFullScreenDetection()
         startOutsideClickMonitor()
+        startAppSwitchMonitor()
+        startShiftPeekMonitor()
+        startActivityMonitor()
+
+        // 全屏里被 Shift 叫出来时要立刻把窗口显示出来（而不是等下一次全屏状态变化）
+        model.$fullScreenPeek
+            .receive(on: RunLoop.main)
+            .sink { [weak self] peek in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    if peek {
+                        self.updateFullScreenVisibility()
+                    } else {
+                        // 先让面板收回的动画跑完，再把窗口淡出，否则看起来是“啪”一下没了
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
+                            MainActor.assumeIsolated { self.updateFullScreenVisibility() }
+                        }
+                    }
+                }
+            }
+            .store(in: &cancellables)
 
         // 自检用：以指定面板的展开态启动，方便截图核对玻璃效果
         if let arg = CommandLine.arguments.first(where: { $0.hasPrefix("--start-expanded") }) {
@@ -96,6 +198,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // 自检用：不按真实前台判断，始终当作非全屏（核对桌宠自由摆放）
+        if CommandLine.arguments.contains("--force-windowed") {
+            forceWindowedForTest = true
+        }
+
+        // 自检用：假装当前在全屏 App 里，核对「全屏隐藏 + 双击 Shift 呼出」
+        if CommandLine.arguments.contains("--force-fullscreen") {
+            forceFullScreenForTest = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.model.hideOnFullScreen = true
+                    self.model.isFullScreenApp = true
+                    self.updateFullScreenVisibility()
+                }
+            }
+        }
+
         // 自检用：只打开设置窗口，岛保持自然收起，不遮挡设置内容
         if CommandLine.arguments.contains("--open-settings") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
@@ -110,6 +230,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             model.hovered = true
             model.pinned = true
             model.showModelPicker = true
+        }
+
+        // 开箱向导：首次启动自动弹，--welcome 强制重看
+        if CommandLine.arguments.contains("--welcome") || UsageStore.isFreshInstall {
+            DesktopSnapshot.captureIfNeeded()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                WelcomeWindowController.shared.show()
+            }
+        }
+
+        // 自检用：--pet-log=<路径> 记录桌宠摆动触发
+        if let arg = CommandLine.arguments.first(where: { $0.hasPrefix("--pet-log=") }) {
+            let path = String(arg.dropFirst("--pet-log=".count))
+            FileManager.default.createFile(atPath: path, contents: nil)
+            PetSwing.logPath = path
+        }
+
+        // 自检用：--pet-click 模拟点一下桌宠，核对是否进对话
+        if CommandLine.arguments.contains("--pet-click") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                MainActor.assumeIsolated { self?.petWindows.openChatFromPet() }
+            }
+        }
+
+        // 自检用：--pet-rebuild 拿已导入的原图按当前切分算法重建部件
+        if CommandLine.arguments.contains("--pet-rebuild") {
+            PetStore.shared.rebuildFromPhotos()
+        }
+
+        // 自检用：--pet-import=<图片> 直接建桌面宠物并开启
+        if let arg = CommandLine.arguments.first(where: { $0.hasPrefix("--pet-import=") }) {
+            let path = String(arg.dropFirst("--pet-import=".count))
+            let styleArg = CommandLine.arguments.first(where: { $0.hasPrefix("--pet-style=") })
+                .map { String($0.dropFirst("--pet-style=".count)) } ?? "normal"
+            PetStore.shared.importPhotos([URL(fileURLWithPath: path)],
+                                         style: PetStyle(rawValue: styleArg) ?? .normal)
         }
     }
 
@@ -150,34 +306,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         checkFullScreen()
     }
 
+    private var forceFullScreenForTest = false
+    private var forceWindowedForTest = false
+
     private func checkFullScreen() {
-        guard let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier else {
+        if forceFullScreenForTest {
+            model.isFullScreenApp = true
+            updateFullScreenVisibility()
+            return
+        }
+        if forceWindowedForTest {
             model.isFullScreenApp = false
             updateFullScreenVisibility()
             return
         }
+        let frontApp = NSWorkspace.shared.frontmostApplication
+        let frontPID = frontApp?.processIdentifier
+        let frontName = frontApp?.localizedName ?? ""
         let options = CGWindowListOption(arrayLiteral: .optionOnScreenOnly, .excludeDesktopElements)
         let windows = (CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]]) ?? []
-        let screenFrame = islandWindow?.screen?.frame ?? NSScreen.main?.frame ?? .zero
+        let scr = islandWindow?.screen ?? NSScreen.main
+        let screenFrame = scr?.frame ?? .zero
 
+        // 硬信号：全屏空间里菜单栏会被收掉，visibleFrame 顶到屏幕顶边。
+        // 这个判断不看前台是谁，前台被系统报成 loginwindow 时也能兜住。
         var full = false
+        if let vf = scr?.visibleFrame, abs(vf.maxY - screenFrame.maxY) < 2, vf.height > 0 {
+            full = true
+        }
+
+        // 前台拿不到、或被报成 loginwindow（锁屏/全屏空间常见）时，
+        // 退一步：任何 App 的普通窗口正好铺满屏幕，也当作全屏
+        let frontUnknown = (frontPID == nil) || frontName == "loginwindow"
+
+        if !full, frontUnknown {
+            for win in windows {
+                guard let pid = win[kCGWindowOwnerPID as String] as? Int else { continue }
+                if pid == ProcessInfo.processInfo.processIdentifier { continue }
+                guard let layer = win[kCGWindowLayer as String] as? Int, layer == 0 else { continue }
+                guard let b = win[kCGWindowBounds as String] as? [String: Any],
+                      let bw = b["Width"] as? Double, let bh = b["Height"] as? Double,
+                      bw > 0, bh > 0 else { continue }
+                if abs(bw - screenFrame.width) < 2 && abs(bh - screenFrame.height) < 2 {
+                    full = true
+                    break
+                }
+            }
+        }
+
+        if !full, let frontPID {
         for win in windows {
             guard let pid = win[kCGWindowOwnerPID as String] as? Int, pid == frontPID else { continue }
             guard let layer = win[kCGWindowLayer as String] as? Int, layer == 0 else { continue }
-            guard let bounds = win[kCGWindowBounds as String] as? CGRect else { continue }
-            // 前台 App 有覆盖整块屏幕的普通窗口，即视为全屏
-            if abs(bounds.width - screenFrame.width) < 2 && abs(bounds.height - screenFrame.height) < 2 {
+            // kCGWindowBounds 是 CFDictionary，不能直接 as? CGRect，必须按字段取
+            guard let b = win[kCGWindowBounds as String] as? [String: Any],
+                  let bw = b["Width"] as? Double, let bh = b["Height"] as? Double,
+                  bw > 0, bh > 0 else { continue }
+            let bs = islandWindow?.screen?.backingScaleFactor ?? 2
+            let pw = screenFrame.width * bs, ph = screenFrame.height * bs
+            // 前台 App 有一个正好覆盖整块屏幕的普通窗口（点或像素两种坐标都兼容），即视为全屏
+            if abs(bw - screenFrame.width) < 2 && abs(bh - screenFrame.height) < 2 {
+                full = true
+                break
+            }
+            if abs(bw - pw) < 2 && abs(bh - ph) < 2 {
                 full = true
                 break
             }
         }
+        }
+
         model.isFullScreenApp = full
         updateFullScreenVisibility()
     }
 
     private func updateFullScreenVisibility() {
-        // 用 alpha 淡出而非关闭窗口，回到桌面时能立刻恢复
-        islandWindow?.alphaValue = model.shouldHideForFullScreen ? 0 : 1
+        // 用 alpha 淡出而非关闭窗口，回到桌面时能立刻恢复；淡入淡出带 0.18s 过渡，不要硬切
+        guard let w = islandWindow else { return }
+        let visible = !model.shouldHideForFullScreen || model.fullScreenPeek
+        let target: CGFloat = visible ? 1 : 0
+        guard abs(w.alphaValue - target) > 0.001 else { return }
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.18
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            w.animator().alphaValue = target
+        }
     }
 
     /// 点击岛外区域时自动收起（全局监听，App 不活跃也能收到）
@@ -185,11 +398,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.model.clickOutsideCollapse, self.model.expanded else { return }
-                withAnimation(IslandModel.spring) {
-                    self.model.hovered = false
-                    self.model.pinned = false
+                guard !self.model.cameraAuthInFlight else { return } // 授权弹窗上点允许/拒绝，不当岛外点击
+                self.model.collapse()
+            }
+        }
+    }
+
+    // MARK: 全屏双击 Shift 呼出
+
+    private var shiftPressCount = 0
+    private var lastShiftPress: TimeInterval = 0
+    private var shiftHeld = false
+
+    /// 全屏 App 里连按两下 Shift 把岛叫出来，再连按两下收回。
+    /// 用全局 flagsChanged 监听：全局键盘事件需要系统「输入监控」权限，没有就申请一次。
+    /// 诊断：把输入监控权限与事件到达情况写一行日志，方便判断"监听失效"是权限还是逻辑
+    private func peekLog(_ s: String) {
+        let line = "\(Date().timeIntervalSince1970) \(s)\n"
+        let url = URL(fileURLWithPath: "/tmp/di_peek.log")
+        if let h = try? FileHandle(forWritingTo: url) { h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); try? h.close() }
+        else { try? line.write(to: url, atomically: true, encoding: .utf8) }
+    }
+
+    private func startShiftPeekMonitor() {
+        if !CGPreflightListenEventAccess() {
+            _ = CGRequestListenEventAccess()
+        }
+        peekLog("start: listen=\(CGPreflightListenEventAccess()) ax=\(AXIsProcessTrusted())")
+        let masks: NSEvent.EventTypeMask = [.flagsChanged, .keyDown]
+        NSEvent.addGlobalMonitorForEvents(matching: masks) { [weak self] event in
+            MainActor.assumeIsolated { self?.handleShiftPeek(event) }
+        }
+        NSEvent.addLocalMonitorForEvents(matching: masks) { [weak self] event in
+            MainActor.assumeIsolated { self?.handleShiftPeek(event) }
+            return event
+        }
+    }
+
+    private func handleShiftPeek(_ event: NSEvent) {
+        guard model.peekOnFullScreen else { return }
+        if event.type == .keyDown {
+            shiftPressCount = 0    // 中间按了别的键就重新计数，避免和正常打字混在一起
+            return
+        }
+        guard event.keyCode == 56 || event.keyCode == 60 else { return }  // 左 / 右 Shift
+        let down = event.modifierFlags.contains(.shift)
+        // 状态自愈：如果 shiftHeld 卡在 true（事件丢过一次就会永久卡死，监听看起来"挂了"），
+        // 超过 1.5 秒没新按下就强制复位
+        if shiftHeld, event.timestamp - lastShiftPress > 1.5 { shiftHeld = false }
+        if down, !shiftHeld {
+            shiftHeld = true
+            let dt = event.timestamp - lastShiftPress
+            if dt > 0, dt < 0.35, shiftPressCount >= 1 {
+                shiftPressCount = 0
+                peekLog("double shift -> toggle")
+                model.toggleFullScreenPeek()
+            } else {
+                shiftPressCount = 1
+            }
+            lastShiftPress = event.timestamp
+        } else if !down {
+            shiftHeld = false
+        }
+    }
+
+    /// 切到别的 App（比如 Safari）就自动收起，不用等鼠标动作
+    private func startAppSwitchMonitor() {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil, queue: .main) { [weak self] note in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                          app.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
+                    self.model.collapse()
                 }
             }
+    }
+
+    /// 监听真实鼠标/键盘活动，复位久坐计时（全局+本地，App 是否活跃都能收到）
+    private func startActivityMonitor() {
+        let masks: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDown, .rightMouseDown,
+                                           .keyDown, .scrollWheel]
+        NSEvent.addGlobalMonitorForEvents(matching: masks) { [weak self] event in
+            MainActor.assumeIsolated {
+                self?.model.markUserActivity()
+            }
+        }
+        NSEvent.addLocalMonitorForEvents(matching: masks) { [weak self] event in
+            MainActor.assumeIsolated { self?.model.markUserActivity() }
+            return event
         }
     }
 
@@ -210,6 +508,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let scale = min(max(screen.frame.width / 1728.0, 0.85), 1.7)
         model.screenScale = scale
 
+        // 顶部硬件形态：先按屏幕原生像素精确匹配已知机型（区分灵动岛/刘海），
+        // 匹配不到再退回 safeAreaInsets 判断
+        let cutout = screen.safeAreaInsets.top
+        model.topCutout = cutout
+        let bs = screen.backingScaleFactor
+        let nativeW = Int((screen.frame.width * bs).rounded())
+        let nativeH = Int((screen.frame.height * bs).rounded())
+        if let profile = DisplayProfile.match(nativeWidth: nativeW, nativeHeight: nativeH) {
+            model.deviceKind = profile.form
+            model.touchScreen = profile.touch
+        } else if cutout > 0.5 {
+            model.deviceKind = .notch
+            model.touchScreen = false
+        } else {
+            model.deviceKind = .standard
+            model.touchScreen = false
+        }
+
         let windowSize = CGSize(width: 880 * scale, height: 640 * scale)
         model.windowSize = windowSize
 
@@ -218,6 +534,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                            width: windowSize.width,
                            height: windowSize.height)
         window.setFrame(frame, display: true)
+
     }
 
     /// 菜单栏留一个入口：没 Dock 图标也能打开设置
@@ -245,7 +562,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
     }
 
-    @objc private func openSettings() { settings.show() }
+    @objc private func openSettings() {
+        if let raw = UserDefaults.standard.string(forKey: "demo.settingsSection"),
+           let sec = SettingsSection(rawValue: raw) {
+            SettingsState.shared.section = sec
+        }
+        settings.show()
+    }
     @objc private func refreshWeather() { model.refreshWeather() }
     @objc private func quitApp() { NSApp.terminate(nil) }
 
@@ -270,8 +593,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard rect.width > 0 else { window.ignoresMouseEvents = true; return }
 
         let p = NSEvent.mouseLocation                       // 屏幕坐标，左下原点
+        // rect 是 SwiftUI 的「距窗口顶部」坐标，窗口 frame 用左下原点，
+        // 换算成屏幕左下原点时：y = frame.maxY - rect.minY - rect.height。
         let islandInScreen = CGRect(x: window.frame.minX + rect.minX,
-                                    y: window.frame.maxY - rect.maxY,
+                                    y: window.frame.maxY - rect.minY - rect.height,
                                     width: rect.width,
                                     height: rect.height)
         let inside = islandInScreen.contains(p)
