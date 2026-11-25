@@ -36,7 +36,7 @@ xattr -dr com.apple.quarantine "灵动岛.app"
 
 ## 安装
 
-不想编译就直接装 DMG：到 [Releases](https://github.com/OneStudiocore/dynamic-island/releases) 下 `灵动岛-1.0.dmg`，双击打开后把 `灵动岛.app` 拖进「应用程序」。首次启动如果被系统拦下，执行一次：
+不想编译就直接装 DMG：到 [Releases](https://github.com/OneStudiocore/dynamic-island/releases) 下 `DynamicIsland-1.2.dmg`，双击打开后把 `灵动岛.app` 拖进「应用程序」。首次启动如果被系统拦下，执行一次：
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/灵动岛.app"
@@ -45,7 +45,7 @@ xattr -dr com.apple.quarantine "/Applications/灵动岛.app"
 自己打一个同样的 DMG：
 
 ```bash
-./Tools/make-dmg.sh          # 产出 dist/灵动岛-1.0.dmg
+./Tools/make-dmg.sh 1.2      # 产出 dist/灵动岛-1.2.dmg
 ```
 
 ## 页签
